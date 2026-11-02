@@ -146,8 +146,10 @@ export const uploadWebDavBackup = async (
   await client.createDirectory(normalized.remotePath, { recursive: true });
 
   const filename = `edgeever-${timestamp.toISOString().replace(/[:.]/g, "-")}.zip`;
-  const remotePath = `${normalized.remotePath}/${filename}`;
+  const remotePath = `${normalized.remotePath.replace(/\/$/, "")}/${filename}`;
+  // The webdav client JSON-serializes Blob/File bodies, so send raw bytes.
   const uploaded = await client.putFileContents(remotePath, await archive.arrayBuffer(), {
+    contentLength: archive.size,
     overwrite: false,
   });
 

@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const planNativeRelease = (platform, changedFiles) => {
-  if (!["mobile", "desktop"].includes(platform)) {
+  if (!["mobile", "desktop", "ios"].includes(platform)) {
     throw new Error(`Unsupported native release platform: ${platform}`);
   }
 
@@ -11,39 +11,75 @@ export const planNativeRelease = (platform, changedFiles) => {
     (file) => !file.endsWith(".md"),
   );
 
+  const mobileOnlyDependencyPatches = runtimeChangedFiles.filter((file) =>
+    file.startsWith("patches/expo-sharing@")
+  );
+  const lockfileIsMobileOnly =
+    mobileOnlyDependencyPatches.length > 0 &&
+    runtimeChangedFiles.every((file) =>
+      file === "package.json" ||
+      file === "bun.lock" ||
+      file.startsWith("apps/mobile/") ||
+      file.startsWith("patches/expo-sharing@") ||
+      file.startsWith("scripts/plan-native-release")
+    );
+
   const relevantPrefixes =
     platform === "mobile"
       ? ["apps/mobile/", "packages/client/", "packages/shared/"]
-      : [
-          "apps/desktop/",
-          "apps/web/",
-          "crates/desktop-sidecar/",
-          "packages/client/",
-          "packages/shared/",
-        ];
+      : platform === "ios"
+        ? ["apps/ios/", "packages/shared/"]
+        : [
+            "apps/desktop/",
+            "apps/web/",
+            "crates/desktop-sidecar/",
+            "migrations/",
+            "packages/client/",
+            "packages/shared/",
+          ];
 
   const relevantFiles =
     platform === "mobile"
       ? new Set([
           ".github/workflows/mobile-build.yml",
+          ".github/workflows/android-play-signature-audit.yml",
+          ".github/workflows/store-delivery.yml",
           "bun.lock",
           "scripts/build-android-local.sh",
+          "scripts/download-play-universal-apk.mjs",
           "scripts/verify-android-apk-signature.mjs",
+          ...mobileOnlyDependencyPatches,
         ])
+      : platform === "ios"
+        ? new Set()
       : new Set([
+          ".cargo/config.toml",
           ".github/workflows/desktop-build.yml",
           "bun.lock",
           "scripts/create-mac-update-metadata.mjs",
+          "scripts/create-windows-update-metadata.mjs",
+          "scripts/verify-linux-update-release.mjs",
+          "scripts/verify-linux-appimage-update.mjs",
           "scripts/desktop-icns.mjs",
           "scripts/prepare-desktop-icons.mjs",
+          "scripts/pe-imports.mjs",
           "scripts/run-desktop-builder.mjs",
+          "scripts/sign-windows-update-manifest.mjs",
+          "scripts/verify-windows-update-release.mjs",
           "scripts/verify-desktop-package.mjs",
+          "scripts/desktop-production-files.mjs",
+          "scripts/verify-desktop-production-runtime.cjs",
+          "scripts/verify-desktop-cross-version-startup.mjs",
+          "scripts/verify-packaged-desktop-startup.mjs",
+          "scripts/verify-renderer-origin-migration.mjs",
         ]);
 
   const relevantChanges = runtimeChangedFiles.filter(
     (file) =>
       relevantPrefixes.some((prefix) => file.startsWith(prefix)) ||
       relevantFiles.has(file),
+  ).filter((file) =>
+    !(platform === "desktop" && file === "bun.lock" && lockfileIsMobileOnly),
   );
 
   return {
@@ -55,9 +91,9 @@ export const planNativeRelease = (platform, changedFiles) => {
 const run = () => {
   const [platform, baseRef, headRef] = process.argv.slice(2);
 
-  if (!["mobile", "desktop"].includes(platform) || !baseRef || !headRef) {
+  if (!["mobile", "desktop", "ios"].includes(platform) || !baseRef || !headRef) {
     console.error(
-      "Usage: node scripts/plan-native-release.mjs <mobile|desktop> <base-ref> <head-ref>",
+      "Usage: node scripts/plan-native-release.mjs <mobile|desktop|ios> <base-ref> <head-ref>",
     );
     process.exit(1);
   }

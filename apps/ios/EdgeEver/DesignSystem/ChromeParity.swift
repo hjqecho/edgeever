@@ -14,6 +14,7 @@ enum CreateMemoChrome {
     static let metaRow = "createMemoMetaRow"
     static let notebook = "createMemoNotebookButton"
     static let tags = "createMemoTagsInput"
+    static let smartTags = "createMemoSmartTagsButton"
     static let editorFrame = "createMemoEditorFrame"
     static let imageTool = "createMemoImageTool"
 }
@@ -46,6 +47,17 @@ enum CreateSaveStatus: Equatable, Sendable {
         case .creating: return "Creating"
         case .uploading: return "Uploading"
         case .error: return "Save failed"
+        }
+    }
+
+    var labelPL: String {
+        switch self {
+        case .starting: return "Uruchamianie"
+        case .saved: return "Zapisano"
+        case .saving: return "Zapisywanie"
+        case .creating: return "Tworzenie"
+        case .uploading: return "Przesyłanie"
+        case .error: return "Nie udało się zapisać"
         }
     }
 
@@ -118,6 +130,16 @@ enum DetailSyncStatus: Equatable, Sendable {
         case .syncing: return "Saving"
         case .conflict: return "Conflict"
         case .error: return "Sync failed"
+        }
+    }
+
+    var labelPL: String {
+        switch self {
+        case .synced: return "Zsynchronizowano"
+        case .pending: return "Oczekuje"
+        case .syncing: return "Zapisywanie"
+        case .conflict: return "Konflikt"
+        case .error: return "Błąd synchronizacji"
         }
     }
 

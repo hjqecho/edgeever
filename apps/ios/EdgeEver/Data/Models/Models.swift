@@ -29,6 +29,28 @@ struct MobileSession: Codable, Equatable, Sendable {
     var user: AuthUser?
 }
 
+struct InstanceStorageDiagnostics: Codable, Equatable, Sendable {
+    var database: String?
+    var resources: String?
+}
+
+struct InstanceHealth: Codable, Equatable, Sendable {
+    var ok: Bool
+    var name: String
+    var runtime: String?
+    var containerImageSource: String?
+    var authMode: String?
+    var build: String?
+    var deploymentVersionCreatedAt: String?
+    var migration: String?
+    var storage: InstanceStorageDiagnostics?
+    var objectStorageProvider: String?
+}
+
+struct InstanceRelease: Codable, Equatable, Sendable {
+    var version: String
+}
+
 struct LoginDeviceSession: Codable, Equatable, Sendable, Identifiable {
     var id: String
     var userAgent: String?
@@ -147,11 +169,101 @@ enum AiAction: String, Codable, CaseIterable, Sendable, Identifiable {
 
 struct AiGenerateInput: Encodable, Sendable {
     var action: AiAction
+    var promptId: String? = nil
+    var locale: String? = nil
     var title: String
     var contentMarkdown: String
     var targetLanguage: String?
     var tone: String? = nil
     var instruction: String? = nil
+}
+
+struct AiGenerationResultBoundary: Decodable, Sendable {
+    var start: String
+    var end: String
+}
+
+struct AiPreparedGeneration: Decodable, Sendable {
+    var provider: String
+    var baseUrl: String
+    var apiKey: String
+    var modelId: String
+    var system: String
+    var prompt: String
+    var maxOutputTokens: Int
+    var resultBoundary: AiGenerationResultBoundary
+}
+
+struct AiPreparedTagSuggestions: Decodable, Sendable {
+    var provider: String
+    var baseUrl: String
+    var apiKey: String
+    var modelId: String
+    var system: String
+    var prompt: String
+    var maxOutputTokens: Int
+    var currentTags: [String]
+    var canonicalTags: [String: String]
+}
+
+struct AiTagSuggestionsInput: Encodable, Sendable {
+    var title: String
+    var contentMarkdown: String
+    var currentTags: [String]
+    var locale: String
+}
+
+struct AiTagSuggestion: Codable, Equatable, Sendable, Identifiable {
+    var name: String
+    var existing: Bool
+
+    var id: String { name }
+}
+
+struct AiTagSuggestionsResponse: Codable, Equatable, Sendable {
+    var suggestions: [AiTagSuggestion]
+}
+
+enum AiPromptParameterKind: String, Codable, Sendable {
+    case none
+    case targetLanguage = "target-language"
+    case tone
+}
+
+enum AiPromptResultMode: String, Codable, Sendable {
+    case append
+    case replace
+    case both
+}
+
+struct AiAssistantLastActionPreference: Codable, Equatable, Sendable {
+    var action: AiAction
+    var promptId: String?
+    var seedKey: String?
+    var targetLanguage: String?
+    var tone: String?
+}
+
+struct AiAssistantLastActionStore: Codable, Equatable, Sendable {
+    var selected: AiAssistantLastActionPreference? = nil
+    var wholeNote: AiAssistantLastActionPreference? = nil
+}
+
+struct AiPromptTemplate: Codable, Equatable, Sendable, Identifiable {
+    var id: String
+    var origin: String
+    var seedKey: String?
+    var action: AiAction
+    var parameterKind: AiPromptParameterKind
+    var resultMode: AiPromptResultMode
+    var nameCustomized: Bool
+    var descriptionCustomized: Bool
+    var instructionCustomized: Bool
+    var name: String
+    var description: String?
+    var instruction: String
+    var createdAt: String
+    var updatedAt: String
 }
 
 struct AiStreamEvent: Decodable, Sendable {
@@ -220,6 +332,7 @@ struct MemoShare: Codable, Equatable, Sendable {
     var token: String
     var createdAt: String
     var updatedAt: String
+    var passwordProtected: Bool?
 }
 
 struct InstanceUser: Codable, Equatable, Sendable, Identifiable {
@@ -239,7 +352,7 @@ struct MobileSyncBootstrapPage: Codable, Sendable {
     var memos: [MemoDetail]
     var snapshotCursor: Int
     var syncIdentity: String?
-    var totalCount: Int
+    var totalCount: Int?
     var nextAfterId: String?
 }
 
@@ -299,12 +412,17 @@ struct TagsResponse: Codable, Sendable {
     var tags: [TagSummary]
 }
 
+struct AiPromptsResponse: Codable, Sendable {
+    var prompts: [AiPromptTemplate]
+}
+
 // MARK: - Outbox / drafts domain
 
 enum MemoSortMode: String, CaseIterable, Sendable {
     case updatedDesc = "updated-desc"
     case createdDesc = "created-desc"
     case titleAsc = "title-asc"
+    case titleDesc = "title-desc"
 }
 
 enum MemoFilterMode: String, CaseIterable, Sendable {

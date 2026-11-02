@@ -8,31 +8,60 @@ export type GitHubFeedbackSystemInfoItem = {
 export const buildGitHubFeedbackUrl = ({
   contentHeading,
   contentPrompt,
+  diagnostics,
   privacyNotice,
   systemInfo,
   systemInfoHeading,
   systemInfoNotice,
   titlePrefix,
+  client,
 }: {
   contentHeading: string;
   contentPrompt: string;
+  diagnostics?: {
+    heading: string;
+    notice: string;
+    text: string;
+  };
   privacyNotice: string;
   systemInfo: GitHubFeedbackSystemInfoItem[];
   systemInfoHeading: string;
   systemInfoNotice: string;
   titlePrefix: string;
+  client?: string;
 }) => {
+  const systemInfoText = systemInfo.map((item) => `- ${item.label}: ${item.value}`).join("\n");
   const body = [
     `## ${contentHeading}`,
     "",
     `<!-- ${contentPrompt} -->`,
     "",
+    ...(diagnostics ? [
+      `## ${diagnostics.heading}`,
+      "",
+      `<!-- ${diagnostics.notice} -->`,
+      "",
+      "```json",
+      diagnostics.text,
+      "```",
+      "",
+    ] : []),
     `## ${systemInfoHeading}`,
     "",
     `<!-- ${systemInfoNotice} -->`,
-    ...systemInfo.map((item) => `- ${item.label}: ${item.value}`),
+    systemInfoText,
     "",
     `> ${privacyNotice}`,
   ].join("\n");
-  return `${GITHUB_NEW_ISSUE_URL}?title=${encodeURIComponent(titlePrefix)}&body=${encodeURIComponent(body)}`;
+  const params = new URLSearchParams({
+    title: titlePrefix,
+    body,
+    "system-info": systemInfoText,
+  });
+  if (diagnostics) {
+    params.set("template", "bug.yml");
+    params.set("diagnostics", diagnostics.text);
+  }
+  if (client) params.set("client", client);
+  return `${GITHUB_NEW_ISSUE_URL}?${params.toString()}`;
 };

@@ -8,7 +8,13 @@ import { isProtectedDemoAccount } from "./demo-mode";
 import { createId, isoNow } from "./entity-utils";
 import { badRequest, conflict, forbidden, notFound, unauthorized } from "./http-errors";
 import { requireOwner } from "./request-auth";
+import { mapResourceStorageSummary, type ResourceStatsRow } from "./resource-service";
 import type { DatabaseAdapter } from "./storage-contract";
+import { markWorkspaceExampleSeedPendingStatement } from "./workspace-example-seed";
+import {
+  createDefaultNotebookRows,
+  markWorkspaceSeedLocalizationPendingStatement,
+} from "./workspace-provisioning";
 
 export type InstanceUserRow = {
   id: string;
@@ -21,17 +27,8 @@ export type InstanceUserRow = {
   role: "owner" | "member";
 };
 
-type DefaultNotebookRow = {
-  id: string;
-  name: string;
-  slug: string;
-  color: string;
-  sortOrder: number;
-};
-
 type UserRouteDependencies = {
   authenticateRequest: (context: AppContext, touch: boolean) => Promise<AuthContext | null>;
-  createDefaultNotebookRows: (workspaceId: string, now: string) => DefaultNotebookRow[];
   getInstanceUser: (database: DatabaseAdapter, userId: string) => Promise<InstanceUserRow | null>;
 };
 
@@ -59,6 +56,41 @@ export const registerUserRoutes = (
   app: Hono<AppEnv>,
   dependencies: UserRouteDependencies,
 ) => {
+  app.get("/api/v1/instance/storage-usage", async (context) => {
+    const denied = await requireOwnerRequest(context, dependencies.authenticateRequest);
+    if (denied) return denied;
+
+    const [stats, userStats] = await Promise.all([
+      context.env.storage.db.prepare(
+        `SELECT COUNT(*) AS total_count,
+                COALESCE(SUM(r.byte_size), 0) AS total_bytes,
+                COALESCE(SUM(CASE WHEN r.kind = 'image' THEN 1 ELSE 0 END), 0) AS image_count,
+                COALESCE(SUM(CASE WHEN r.kind = 'attachment' THEN 1 ELSE 0 END), 0) AS attachment_count
+         FROM resources r
+         INNER JOIN memos m ON m.id = r.memo_id
+         WHERE r.is_deleted = 0`,
+      ).first<ResourceStatsRow>(),
+      context.env.storage.db.prepare(
+        `SELECT wm.user_id, COUNT(r.memo_id) AS total_count,
+                COALESCE(SUM(r.byte_size), 0) AS total_bytes,
+                COALESCE(SUM(CASE WHEN r.kind = 'image' THEN 1 ELSE 0 END), 0) AS image_count,
+                COALESCE(SUM(CASE WHEN r.kind = 'attachment' THEN 1 ELSE 0 END), 0) AS attachment_count
+         FROM workspace_members wm
+         LEFT JOIN memos m ON m.workspace_id = wm.workspace_id
+         LEFT JOIN resources r ON r.memo_id = m.id AND r.is_deleted = 0
+         GROUP BY wm.user_id`,
+      ).all<ResourceStatsRow & { user_id: string }>(),
+    ]);
+
+    return context.json({
+      summary: mapResourceStorageSummary(stats),
+      users: userStats.results.map((row) => ({
+        userId: row.user_id,
+        summary: mapResourceStorageSummary(row),
+      })),
+    });
+  });
+
   app.get("/api/v1/users", async (context) => {
     const denied = await requireOwnerRequest(context, dependencies.authenticateRequest);
     if (denied) return denied;
@@ -88,7 +120,10 @@ export const registerUserRoutes = (
     const workspaceId = createId("ws");
     const now = isoNow();
     const passwordHash = await hashPassword(input.password);
-    const notebooks = dependencies.createDefaultNotebookRows(workspaceId, now);
+    // The owner's language is not the member's. Notebooks start in the owner's
+    // locale and, together with the default templates, are localized at the
+    // member's first sign-in.
+    const notebooks = createDefaultNotebookRows(workspaceId, context.req.header("accept-language"));
     const statements = [
       context.env.storage.db.prepare(
         `INSERT INTO users (id, username, password_hash, display_name, created_at, updated_at)
@@ -104,6 +139,8 @@ export const registerUserRoutes = (
         `INSERT INTO notebooks (id, workspace_id, parent_id, name, slug, icon, color, sort_order, created_at, updated_at)
          VALUES (?, ?, NULL, ?, ?, 'notebook', ?, ?, ?, ?)`,
       ).bind(notebook.id, workspaceId, notebook.name, notebook.slug, notebook.color, notebook.sortOrder, now, now)),
+      markWorkspaceSeedLocalizationPendingStatement(context.env.storage.db, workspaceId, now),
+      markWorkspaceExampleSeedPendingStatement(context.env.storage.db, workspaceId, now),
       auditStatement(context.env.storage.db, "user", context.get("auth").actorId, "user.create", "user", userId, {
         username: input.username,
       }),

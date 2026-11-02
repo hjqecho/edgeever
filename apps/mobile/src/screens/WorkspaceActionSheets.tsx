@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import type { MemoSortMode } from "@edgeever/client";
 import { Modal, ScrollView, View } from "react-native";
-import { Check, CheckSquare, FileText, Folder, List, MoreVertical, Sparkles, Trash2, X } from "../components/icons";
+import { Check, CheckSquare, FileText, Folder, Image, List, MoreVertical, Share2, Sparkles, Tag, Trash2, X } from "../components/icons";
 import { Pressable, Text } from "../components/LocalizedText";
 import type { MobileMemoListDensity } from "../lib/preferences";
 import { styles } from "./workspace-styles";
@@ -79,6 +79,7 @@ export const NotesActionsModal = ({
   onClose,
   onEnterSelection,
   onMemoListDensityChange,
+  onOpenTagFilter,
   onSortModeChange,
   selectionMode,
   visible,
@@ -92,6 +93,7 @@ export const NotesActionsModal = ({
   onClose: () => void;
   onEnterSelection: () => void;
   onMemoListDensityChange: (density: MobileMemoListDensity) => void;
+  onOpenTagFilter: () => void;
   onSortModeChange: (sortMode: MemoSortMode) => void;
   selectionMode: boolean;
   visible: boolean;
@@ -119,6 +121,12 @@ export const NotesActionsModal = ({
                 label="选择笔记"
                 onPress={onEnterSelection}
               />
+              <ActionSheetItem
+                compact
+                icon={<Tag color="#0f172a" size={18} />}
+                label="按标签筛选"
+                onPress={onOpenTagFilter}
+              />
               <View style={styles.listActionDivider} />
             </>
           ) : null}
@@ -140,6 +148,7 @@ export const NotesActionsModal = ({
           <SheetOptionRow active={memoSortMode === "updated-desc"} label="最近更新" onPress={() => onSortModeChange("updated-desc")} />
           <SheetOptionRow active={memoSortMode === "created-desc"} label="创建时间" onPress={() => onSortModeChange("created-desc")} />
           <SheetOptionRow active={memoSortMode === "title-asc"} label="标题 A-Z" onPress={() => onSortModeChange("title-asc")} />
+          <SheetOptionRow active={memoSortMode === "title-desc"} label="标题 Z-A" onPress={() => onSortModeChange("title-desc")} />
         </ScrollView>
       </Pressable>
     </Pressable>
@@ -212,10 +221,13 @@ export const SelectionActionBar = ({
 export const SelectionMoreModal = ({
   bottomOffset,
   canPin,
+  canShare,
   canToggleVisibleSelection,
   onClear,
   onClose,
   onPin,
+  onShare,
+  onShareImage,
   onToggleVisibleSelection,
   pinLabel,
   selectedCount,
@@ -224,10 +236,13 @@ export const SelectionMoreModal = ({
 }: {
   bottomOffset: number;
   canPin: boolean;
+  canShare: boolean;
   canToggleVisibleSelection: boolean;
   onClear: () => void;
   onClose: () => void;
   onPin: () => void;
+  onShare: () => void;
+  onShareImage: () => void;
   onToggleVisibleSelection: () => void;
   pinLabel: string;
   selectedCount: number;
@@ -258,6 +273,18 @@ export const SelectionMoreModal = ({
           icon={<Sparkles color={canPin ? "#0f172a" : "#cbd5e1"} size={18} />}
           label={pinLabel}
           onPress={onPin}
+        />
+        <ActionSheetItem
+          disabled={!canShare}
+          icon={<Share2 color={canShare ? "#0f172a" : "#cbd5e1"} size={18} />}
+          label="分享笔记"
+          onPress={onShare}
+        />
+        <ActionSheetItem
+          disabled={!canShare}
+          icon={<Image color={canShare ? "#0f172a" : "#cbd5e1"} size={18} />}
+          label="分享为图片"
+          onPress={onShareImage}
         />
         <ActionSheetItem icon={<X color="#0f172a" size={18} />} label="取消选择" onPress={onClear} />
       </Pressable>

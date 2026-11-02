@@ -1,10 +1,15 @@
+import { automaticPosterThumbnails } from "./poster-thumbnails.ts";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import { resolveDeploymentBuildMetadata } from "@edgeever/shared/deployment-metadata";
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath, URL } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
-import { resolveAppVersion, resolveDeploymentMethod, resolveDeploymentTrigger, resolveReleaseTimestamp } from "./build-metadata";
+import { localDevelopmentAuth } from "./local-dev-auth";
+import { publicShareMarkdownDev } from "./share-markdown-dev";
+import { resolveAppVersion, resolveReleaseTimestamp } from "./build-metadata";
 
 const readPackageVersion = () => {
   try {
@@ -16,6 +21,31 @@ const readPackageVersion = () => {
   } catch {
     return "0.0.0";
   }
+};
+
+const readReleaseSummary = (packageVersion: string) => {
+  const summaryPath = fileURLToPath(new URL("../../release-summary.json", import.meta.url));
+  const summary = JSON.parse(readFileSync(summaryPath, "utf8")) as {
+    version?: unknown;
+    changes?: unknown;
+  };
+  const localizedChanges = summary.changes && typeof summary.changes === "object" && !Array.isArray(summary.changes)
+    ? Object.entries(summary.changes)
+    : [];
+  if (
+    summary.version !== packageVersion ||
+    localizedChanges.length === 0 ||
+    !localizedChanges.every(([locale, changes]) =>
+      /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(locale) &&
+      Array.isArray(changes) &&
+      changes.length > 0 &&
+      changes.every((item) => typeof item === "string" && item.trim())
+    ) ||
+    !localizedChanges.some(([locale]) => locale.toLowerCase() === "en-us")
+  ) {
+    throw new Error(`release-summary.json must contain valid localized changes and an en-US fallback for package version ${packageVersion}.`);
+  }
+  return summary as { version: string; changes: Record<string, string[]> };
 };
 
 const readGitCommit = () => {
@@ -56,22 +86,13 @@ const buildId = process.env.WORKERS_CI_COMMIT_SHA?.slice(0, 12)
   ?? readGitCommit()
   ?? "local";
 const gitDescription = readGitDescription();
-const appVersion = resolveAppVersion(readPackageVersion(), gitDescription);
+const packageVersion = readPackageVersion();
+const appVersion = resolveAppVersion(packageVersion, gitDescription);
+const releaseSummary = readReleaseSummary(packageVersion);
 const OPTIONAL_CHUNK_WARNING_LIMIT_KB = 1_700;
 const TARGET_VENDOR_CHUNK_BYTES = 450 * 1024;
 const releaseTimestamp = resolveReleaseTimestamp(process.env.EDGE_EVER_RELEASED_AT) || readLatestReleaseCommitTimestamp();
-const deploymentTrigger = resolveDeploymentTrigger(
-  process.env.EDGE_EVER_DEPLOYMENT_TRIGGER
-    ?? (process.env.WORKERS_CI_COMMIT_SHA ? "main_push" : undefined)
-);
-const deploymentMethod = resolveDeploymentMethod(
-  process.env.EDGE_EVER_DEPLOYMENT_METHOD
-    ?? (process.env.WORKERS_CI_COMMIT_SHA
-      ? "cloudflare_workers_builds"
-      : process.env.GITHUB_ACTIONS
-        ? "github_actions"
-        : undefined)
-);
+const deploymentMetadata = resolveDeploymentBuildMetadata(process.env);
 const isDesktopBuild = process.env.EDGE_EVER_DESKTOP_BUILD === "1";
 const developmentServiceWorkerReset: Plugin = {
   name: "edgeever-development-service-worker-reset",
@@ -105,6 +126,11 @@ self.addEventListener("activate", (event) => {
 
 export default defineConfig({
   root: "apps/web",
+  // Poster creation loads Fabric through a lazy module. Prepare it at startup
+  // so the first poster does not trigger dependency optimization mid-session.
+  optimizeDeps: {
+    include: ["fabric"],
+  },
   // Packaged Electron apps load index.html via file://, so root-absolute
   // asset URLs resolve to the filesystem root and leave a blank window.
   base: isDesktopBuild ? "./" : "/",
@@ -113,20 +139,27 @@ export default defineConfig({
     __EDGEEVER_BUILD_ID__: JSON.stringify(buildId),
     __EDGEEVER_BUILD_LABEL__: JSON.stringify(buildId === "local" ? "local" : buildId.slice(0, 7)),
     __EDGEEVER_RELEASED_AT__: JSON.stringify(releaseTimestamp),
-    __EDGEEVER_DEPLOYMENT_TRIGGER__: JSON.stringify(deploymentTrigger),
-    __EDGEEVER_DEPLOYMENT_METHOD__: JSON.stringify(deploymentMethod),
+    __EDGEEVER_RELEASE_SUMMARY__: JSON.stringify(releaseSummary),
+    __EDGEEVER_DEPLOYMENT_TRIGGER__: JSON.stringify(deploymentMetadata.trigger),
+    __EDGEEVER_DEPLOYMENT_METHOD__: JSON.stringify(deploymentMetadata.method),
     __EDGEEVER_DEVELOPMENT_PROFILE__: JSON.stringify(process.env.EDGE_EVER_DEVELOPMENT_PROFILE ?? ""),
+    __EDGEEVER_DESKTOP_BUILD__: JSON.stringify(isDesktopBuild),
   },
   plugins: [
+    automaticPosterThumbnails(),
+    tailwindcss(),
+    localDevelopmentAuth(),
+    publicShareMarkdownDev(),
     developmentServiceWorkerReset,
     react(),
     VitePWA({
       registerType: "autoUpdate",
+      includeAssets: [],
       includeManifestIcons: false,
       manifest: {
         name: "EdgeEver",
         short_name: "EdgeEver",
-        description: "EdgeEver：基于 Cloudflare 全家桶自托管的开源印象笔记。",
+        description: "EdgeEver：基于 Cloudflare 与 Docker 自托管的现代化开源笔记与 AI 个人知识库。",
         start_url: "/",
         scope: "/",
         display: "standalone",
@@ -154,30 +187,20 @@ export default defineConfig({
         ],
       },
       workbox: {
-        globPatterns: ["**/*.{js,css,html,ico,png,svg,webp,woff2}"],
+        // Install-time precache excludes the app shell. The plugin still
+        // injects the web manifest so the app stays installable; other
+        // caches fill on first use.
+        globPatterns: [],
+        globIgnores: ["**/*"],
         cleanupOutdatedCaches: true,
-        additionalManifestEntries: [
-          {
-            revision: buildId,
-            url: `/index.html?edgeever-offline-shell=${encodeURIComponent(buildId)}`,
-          },
-        ],
-        globIgnores: [
-          "index.html",
-          // Noto Sans SC is used only by the on-demand print entry. Precaching every
-          // CJK unicode-range shard adds ~4.5 MiB to every PWA installation.
-          "**/noto-sans-sc-*.woff2",
-          "**/*beautiful-mermaid*.js",
-          "**/*mermaid.core-*.js",
-          "**/vendor-mermaid-*.js",
-          "**/*Diagram-*.js",
-        ],
         navigateFallback: null,
         navigationPreload: true,
         runtimeCaching: [
           {
             urlPattern: ({ request, url }) =>
               request.mode === "navigate" &&
+              // Share HTML includes the note. Leave it out of the shared navigation cache.
+              !/^\/(?:share|s)\//.test(url.pathname) &&
               !["/mobile-edit.html", "/note-print.html", "/tiptap-ime-test.html"].includes(url.pathname),
             handler: "NetworkFirst",
             options: {
@@ -185,9 +208,6 @@ export default defineConfig({
               networkTimeoutSeconds: 5,
               cacheableResponse: {
                 statuses: [0, 200],
-              },
-              precacheFallback: {
-                fallbackURL: `/index.html?edgeever-offline-shell=${encodeURIComponent(buildId)}`,
               },
             },
           },
@@ -206,13 +226,35 @@ export default defineConfig({
             },
           },
           {
-            urlPattern: ({ url }) => /\/assets\/(?:.*beautiful-mermaid|vendor-mermaid|.*mermaid\.core|.*Diagram-)/.test(url.pathname),
+            urlPattern: ({ url }) => /\/assets\/i18n-(?:ja|pl|ru)-/.test(url.pathname),
+            handler: "CacheFirst",
+            options: {
+              cacheName: "edgeever-optional-locales",
+              expiration: {
+                maxEntries: 8,
+                maxAgeSeconds: 60 * 60 * 24 * 30,
+              },
+            },
+          },
+          {
+            urlPattern: ({ url }) => /\/assets\/(?:.*beautiful-mermaid|vendor-mermaid|.*mermaid\.core|.*Diagram-|vendor-x6|vendor-codemirror)/.test(url.pathname),
             handler: "CacheFirst",
             options: {
               cacheName: "edgeever-optional-diagrams",
               expiration: {
                 maxEntries: 120,
                 maxAgeSeconds: 60 * 60 * 24 * 30,
+              },
+            },
+          },
+          {
+            urlPattern: ({ url }) => /\/assets\/(?:vendor~pdf-|pdf\.worker\.min-)/.test(url.pathname),
+            handler: "CacheFirst",
+            options: {
+              cacheName: "edgeever-optional-pdf",
+              expiration: {
+                maxEntries: 4,
+                maxAgeSeconds: 30 * 24 * 60 * 60,
               },
             },
           },
@@ -226,6 +268,8 @@ export default defineConfig({
   ],
   resolve: {
     alias: {
+      // Its browser export requires document; the default table also works in Workers.
+      "decode-named-character-reference": fileURLToPath(import.meta.resolve("decode-named-character-reference")),
       "@": fileURLToPath(new URL("./src", import.meta.url)),
     },
   },
@@ -246,14 +290,14 @@ export default defineConfig({
     emptyOutDir: true,
     // ELK is distributed as one ~1.6 MiB module by beautiful-mermaid. It is
     // loaded only when a diagram is rendered and is excluded from HTML
-    // modulepreload and PWA precache; verify-web-performance.mjs enforces
-    // those constraints for every chunk above Vite's default 500 KiB limit.
+    // modulepreload; verify-web-performance.mjs enforces those constraints
+    // for every chunk above Vite's default 500 KiB limit.
     chunkSizeWarningLimit: OPTIONAL_CHUNK_WARNING_LIMIT_KB,
     modulePreload: isDesktopBuild
       ? false
       : {
           resolveDependencies: (_filename, dependencies) => dependencies.filter((dependency) =>
-            !/(?:vendor-code-highlight|vendor-(?:mermaid|D3|tiptap|prosemirror|floating)|ui-primitives)/.test(dependency),
+            !/(?:vendor-code-highlight|vendor-(?:mermaid|D3|tiptap|prosemirror|floating|codemirror|x6|infographic|zod|streamdown)|vendor~(?:wasm|emacs-lisp)-|vendor-radix(?!-slot)|ui-primitives|ui-button-tooltip|i18n-(?:ja|pl|ru)-)/.test(dependency),
           ),
         },
     rolldownOptions: {
@@ -271,17 +315,47 @@ export default defineConfig({
           : {}),
       },
       output: {
+        // Preserve initialization order when manual vendor groups form cycles.
+        strictExecutionOrder: true,
         codeSplitting: {
+          // Groups own only matching modules. Recursive ownership lets optional
+          // editors capture shared utilities (clsx, tslib, React hooks), making
+          // a basic button or locale load the whole editor at startup.
+          includeDependenciesRecursively: false,
           groups: [
             {
+              // Font coverage tables are static data used by image sharing.
+              // Keep them out of the editor component's JavaScript chunk.
+              name: "note-image-font-manifest",
+              test: /[\\/]note-image-font-manifest\.ts$/,
+              priority: 51,
+            },
+            {
               name: "vendor-code-highlight",
-              test: /node_modules[\\/](?:lowlight|highlight\.js|@tiptap[\\/]extension-code-block-lowlight)[\\/]/,
+              test: /node_modules[\\/](?:lowlight|highlight\.js)[\\/]/,
               priority: 50,
               // lowlight registers highlight.js languages through a cyclic
               // module graph. Splitting this group by size can evaluate a
               // language before its constructor is initialized in packaged
-              // file:// desktop builds, leaving the entire window blank.
-              // Keep the graph atomic and load it lazily instead.
+              // file:// desktop builds, leaving the entire window blank. Keep
+              // that graph atomic, but leave TipTap's lightweight adapter in
+              // the regular extension group so plain mobile code blocks do not
+              // inherit the highlighter as a startup dependency.
+            },
+            {
+              name: "i18n-ja",
+              test: /[\\/]i18n[\\/](?:resources[\\/])?ja\.ts$/,
+              priority: 41,
+            },
+            {
+              name: "i18n-pl",
+              test: /[\\/]i18n[\\/](?:resources[\\/])?pl\.ts$/,
+              priority: 41,
+            },
+            {
+              name: "i18n-ru",
+              test: /[\\/]i18n[\\/](?:resources[\\/])?ru\.ts$/,
+              priority: 41,
             },
             {
               name: "vendor-react",
@@ -289,9 +363,44 @@ export default defineConfig({
               priority: 40,
             },
             {
+              name: "vendor-x6",
+              test: /node_modules[\\/]@antv[\\/]x6[\\/]/,
+              priority: 39,
+              // X6 initializes registries and plugins through a cyclic module
+              // graph. Size-based splitting can evaluate clipboard storage
+              // before Config is initialized, crashing the lazy diagram editor.
+              // Keep the graph atomic and defer the resulting chunk instead.
+            },
+            {
+              name: "vendor-infographic",
+              test: /node_modules[\\/]@antv[\\/]infographic[\\/]/,
+              priority: 39,
+              // AntV Infographic registers its template and shape catalogs through
+              // internal registries. Size-based splitting across chunks breaks
+              // initialization order, causing registry map lookups (e.g. .set)
+              // to fail on undefined during chunk evaluation. Keep this graph
+              // atomic and leave the resulting chunk off the initial modulepreload.
+            },
+            {
               name: "vendor-prosemirror",
               test: /node_modules[\\/](prosemirror-|orderedmap|rope-sequence)[\\/]/,
               priority: 38,
+            },
+            {
+              name: "vendor-codemirror",
+              test: /[\\/]node_modules[\\/](?:@codemirror|@lezer|@uiw[\\/](?:react-)?codemirror|@uiw[\\/]codemirror-themes|codemirror)[\\/]/,
+              priority: 37,
+            },
+            {
+              name: "vendor-streamdown",
+              test: /node_modules[\\/](?:streamdown|@streamdown|micromark|mdast|unist|remark|rehype|vfile|zwitch|longest-streak|character-entities|property-information|space-separated-tokens|comma-separated-tokens|html-void-elements|ccount|devlop|bail|trough|unified)[\\/]/,
+              priority: 35,
+              // Streamdown and the unified/micromark/mdast parser stack rely on
+              // tight cross-module references and top-level initializer functions
+              // (e.g. unist-util-is convert() called at import time by mdast-util-phrasing).
+              // Splitting these modules across chunks via maxSize or entriesAware causes
+              // circular chunk evaluation order issues where convert() is undefined.
+              // Keep the entire Streamdown parsing graph atomic.
             },
             {
               name: "vendor-tiptap-pm",
@@ -310,7 +419,7 @@ export default defineConfig({
             },
             {
               name: "vendor-tiptap-extensions",
-              test: /node_modules[\\/]@tiptap[\\/](extension-|extensions)[\\/]/,
+              test: /node_modules[\\/](?:@tiptap[\\/](?:extension-|extensions)|tiptap-)[\\/]/,
               priority: 30,
             },
             {
@@ -330,8 +439,18 @@ export default defineConfig({
             },
             {
               name: "vendor-query",
-              test: /node_modules[\\/]@tanstack[\\/]react-query[\\/]/,
+              test: /node_modules[\\/]@tanstack[\\/](?:react-query|query-core)[\\/]/,
               priority: 25,
+            },
+            {
+              name: "vendor-zod",
+              test: /node_modules[\\/]zod[\\/]/,
+              priority: 22,
+            },
+            {
+              name: "vendor-i18n",
+              test: /node_modules[\\/](i18next|react-i18next)[\\/]/,
+              priority: 21,
             },
             {
               name: "vendor-storage",
@@ -342,6 +461,14 @@ export default defineConfig({
               name: "vendor-icons",
               test: /node_modules[\\/]lucide-react[\\/]/,
               priority: 18,
+              entriesAware: true,
+            },
+            {
+              name: "vendor-radix-slot",
+              test: /node_modules[\\/]@radix-ui[\\/](?:react-slot|react-compose-refs)[\\/]/,
+              priority: 17,
+              // Button needs Slot in the app shell. Keep this tiny primitive
+              // separate from overlays that are loaded with lazy screens.
             },
             {
               name: "vendor-radix",
@@ -375,6 +502,16 @@ export default defineConfig({
               test: /[\\/](?:beautiful-mermaid|elkjs|entities)(?:@|[\\/])/,
               priority: 13,
               maxSize: TARGET_VENDOR_CHUNK_BYTES,
+            },
+            {
+              name: "ui-button",
+              test: /src[\\/]components[\\/]ui[\\/]button\.tsx$/,
+              priority: 12,
+            },
+            {
+              name: "ui-button-tooltip",
+              test: /src[\\/]components[\\/]ui[\\/]button-tooltip\.tsx$/,
+              priority: 12,
             },
             {
               name: "ui-primitives",

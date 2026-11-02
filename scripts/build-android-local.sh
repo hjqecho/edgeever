@@ -55,6 +55,7 @@ PREBUILD_FINGERPRINT="$({
     apps/mobile/app.json \
     apps/mobile/assets/adaptive-icon-transparent.svg \
     apps/web/public/pwa-512x512.png \
+    patches/expo-sharing@57.0.22.patch \
     bun.lock
 } | shasum | awk '{print $1}')"
 PREBUILD_STAMP="$ANDROID_DIR/.edgeever-prebuild-fingerprint"
@@ -82,7 +83,16 @@ COMMON_ARGS=(
 : "${ANDROID_KEY_ALIAS:?请设置 ANDROID_KEY_ALIAS}"
 : "${ANDROID_KEY_PASSWORD:?请设置 ANDROID_KEY_PASSWORD}"
 
-PLAY_ARCHS="${EDGE_EVER_ANDROID_ARCHS:-armeabi-v7a,arm64-v8a,x86,x86_64}"
+# Expo's DOM exporter writes current files without pruning old files. React Native's
+# Gradle inputs also omit workspace packages. Rebuild only the generated JS/DOM
+# assets from an empty directory; native compilation keeps its existing caches.
+rm -rf "$ANDROID_DIR/app/build/generated/assets/react/release" \
+  "$ANDROID_DIR/app/build/generated/res/react/release"
+run_timed "刷新生产 JavaScript 与 DOM 资源" ./gradlew \
+  :app:createBundleReleaseJsAndAssets --rerun --no-build-cache "${COMMON_ARGS[@]:1}"
+
+
+PLAY_ARCHS="${EDGE_EVER_ANDROID_PLAY_ARCHS:-arm64-v8a}"
 APK_ARCHS="${EDGE_EVER_ANDROID_APK_ARCHS:-arm64-v8a}"
 KEYSTORE_FILE="$(cd "$(dirname "$ANDROID_KEYSTORE_FILE")" && pwd)/$(basename "$ANDROID_KEYSTORE_FILE")"
 APK_PATH="$ANDROID_DIR/app/build/outputs/apk/release/app-release.apk"
@@ -143,7 +153,20 @@ run_timed "Gradle 生产 AAB 构建" ./gradlew bundleRelease \
   -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD" \
   -Pandroid.injected.signing.store.type=PKCS12
 
-run_timed "校验 AAB 签名" jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+AAB_PATH="app/build/outputs/bundle/release/app-release.aab"
+PACKAGED_MANIFEST="app/build/intermediates/packaged_manifests/release/processReleaseManifestForPackage/AndroidManifest.xml"
+test -s "$PACKAGED_MANIFEST"
+if grep -q "android.permission.REQUEST_INSTALL_PACKAGES" "$PACKAGED_MANIFEST"; then
+  echo "Play AAB 的最终合并清单仍包含 REQUEST_INSTALL_PACKAGES，停止发布。" >&2
+  exit 1
+fi
+ACTUAL_PLAY_ARCHS="$(unzip -Z1 "$AAB_PATH" | sed -n 's#^base/lib/\([^/]*\)/.*#\1#p' | sort -u | paste -sd, -)"
+if [[ "$ACTUAL_PLAY_ARCHS" != "$PLAY_ARCHS" ]]; then
+  echo "AAB 架构不符合预期：期望 ${PLAY_ARCHS}，实际 ${ACTUAL_PLAY_ARCHS:-无原生库}。" >&2
+  exit 1
+fi
+
+run_timed "校验 AAB 签名" jarsigner -verify "$AAB_PATH"
 test -s app/build/outputs/mapping/release/mapping.txt
-echo "完成: $ANDROID_DIR/app/build/outputs/bundle/release/app-release.aab"
+echo "完成: $ANDROID_DIR/$AAB_PATH"
 echo "反混淆文件: $ANDROID_DIR/app/build/outputs/mapping/release/mapping.txt"

@@ -2,6 +2,8 @@ import { DOMSerializer } from "@tiptap/pm/model";
 import type { Editor } from "@tiptap/react";
 import type { TiptapDoc } from "@edgeever/shared";
 import { getAppPagePath, getMessageTargetOrigin } from "@/lib/app-page-path";
+import { createClientUuid } from "@/lib/client-id";
+import type { NotePrintAppearance } from "@/lib/note-print-appearance";
 
 export const NOTE_PRINT_MESSAGE = "edgeever:note-print";
 export const NOTE_PRINT_READY_MESSAGE = "edgeever:note-print-ready";
@@ -26,6 +28,7 @@ export type NotePrintPayload = {
   html: string;
   language: string;
   labels: NotePrintLabels;
+  appearance: NotePrintAppearance;
 };
 
 type NotePrintReadyMessage = {
@@ -44,7 +47,7 @@ export const openNotePrintPreview = (
   payload: Omit<NotePrintPayload, "type" | "token">,
   preopenedWindow?: Window,
 ) => {
-  const token = crypto.randomUUID();
+  const token = createClientUuid();
   let printWindow: Window | null = preopenedWindow ?? null;
 
   const handleMessage = (event: MessageEvent<NotePrintReadyMessage>) => {

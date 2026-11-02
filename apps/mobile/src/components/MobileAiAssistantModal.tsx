@@ -1,11 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiRequestError } from "@edgeever/client";
+import { useQuery } from "@tanstack/react-query";
 import {
   AI_TARGET_LANGUAGES,
   AI_TONES,
   AI_WHOLE_NOTE_ACTIONS,
+  buildAiAssistantLastActionPreference,
   getDefaultAiTargetLanguage,
+  promptAllowsAppend,
+  promptAllowsReplace,
+  promptNeedsTargetLanguage,
+  promptNeedsTone,
+  resolveAiAssistantOpenAction,
   type AiAction,
+  type AiAssistantLastActionPreference,
   type AiTargetLanguage,
   type AiTone,
   type MemoDetail,
@@ -15,8 +23,9 @@ import { Modal, ScrollView, StyleSheet, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Check, ChevronDown, Copy, RefreshCw, Sparkles, Square, X } from "./icons";
 import { Alert, Pressable, Text, TextInput } from "./LocalizedText";
-import { useMobileLocale } from "../lib/mobile-locale";
+import { useMobileLocale, getMobileCatalog } from "../lib/mobile-locale";
 import { useMobileTheme } from "../lib/mobile-theme";
+import { readMobileAiAssistantLastAction, writeMobileAiAssistantLastAction } from "../lib/preferences";
 import { useSession } from "../lib/session";
 
 type AssistantAction = AiAction;
@@ -26,6 +35,7 @@ type TargetLanguage = AiTargetLanguage;
 const actions = AI_WHOLE_NOTE_ACTIONS;
 const tones = AI_TONES;
 const targetLanguages = AI_TARGET_LANGUAGES;
+const PROMPT_PREFIX = "prompt:";
 
 export const MobileAiAssistantModal = ({
   memo,
@@ -42,8 +52,8 @@ export const MobileAiAssistantModal = ({
   const { resolvedLocale } = useMobileLocale();
   const { resolvedTheme } = useMobileTheme();
   const dark = resolvedTheme === "dark";
-  const tr = (zh: string, en: string) => resolvedLocale === "en-US" ? en : zh;
   const [action, setAction] = useState<AssistantAction>("summarize");
+  const [selectedPromptId, setSelectedPromptId] = useState<string | null>(null);
   const [targetLanguage, setTargetLanguage] = useState<TargetLanguage>(() => getDefaultAiTargetLanguage(resolvedLocale));
   const [tone, setTone] = useState<Tone>("professional");
   const [customInstruction, setCustomInstruction] = useState("");
@@ -54,64 +64,71 @@ export const MobileAiAssistantModal = ({
   const [applying, setApplying] = useState(false);
   const [picker, setPicker] = useState<"action" | "language" | "tone" | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
+  const storedPreferenceRef = useRef<AiAssistantLastActionPreference | null>(null);
+  const [sessionReady, setSessionReady] = useState(false);
+  const [initializedForOpen, setInitializedForOpen] = useState(false);
+  const promptsQuery = useQuery({
+    queryKey: ["ai-prompts", resolvedLocale],
+    queryFn: async () => (await client!.listAiPrompts(resolvedLocale)).prompts,
+    enabled: visible && Boolean(client),
+    retry: false,
+  });
+  const prompts = promptsQuery.data ?? [];
+  const selectedPrompt = prompts.find((prompt) => prompt.id === selectedPromptId) ?? null;
+  const parameterKind = selectedPrompt?.parameterKind
+    ?? (action === "translate" ? "target-language" : action === "change-tone" ? "tone" : "none");
+  const resultMode = selectedPrompt?.resultMode
+    ?? (["summarize", "extract-key-points", "extract-todos", "continue-writing"].includes(action) ? "append" : "both");
 
-  const labels: Record<AssistantAction, string> = {
-    summarize: tr("总结", "Summarize"),
-    "extract-key-points": tr("提炼要点", "Key points"),
-    "extract-todos": tr("提取待办", "Extract tasks"),
-    "rewrite-proofread": tr("改写与校对", "Rewrite & proofread"),
-    "improve-writing": tr("改进写作", "Improve writing"),
-    "fix-spelling-grammar": tr("修正拼写与语法", "Fix spelling & grammar"),
-    "make-shorter": tr("缩短内容", "Make shorter"),
-    "make-longer": tr("扩写内容", "Make longer"),
-    "simplify-language": tr("简化表达", "Simplify language"),
-    "change-tone": tr("调整语气", "Change tone"),
-    translate: tr("翻译", "Translate"),
-    "continue-writing": tr("继续写作", "Continue writing"),
-    custom: tr("自定义要求", "Custom instruction"),
-  };
+  const labels: Record<AssistantAction, string> = getMobileCatalog(resolvedLocale).aiAssistant.actions;
 
-  const languageLabels: Record<TargetLanguage, string> = {
-    en: tr("英语", "English"),
-    "zh-CN": tr("简体中文", "Simplified Chinese"),
-    "zh-TW": tr("繁体中文", "Traditional Chinese"),
-    ja: tr("日语", "Japanese"),
-    ko: tr("韩语", "Korean"),
-    es: tr("西班牙语", "Spanish"),
-    fr: tr("法语", "French"),
-    de: tr("德语", "German"),
-    pt: tr("葡萄牙语", "Portuguese"),
-  };
+  const languageLabels: Record<TargetLanguage, string> = getMobileCatalog(resolvedLocale).aiAssistant.targetLanguages;
 
-  const toneLabels: Record<Tone, string> = {
-    professional: tr("专业", "Professional"),
-    friendly: tr("友好", "Friendly"),
-    casual: tr("轻松", "Casual"),
-    direct: tr("直接", "Direct"),
-  };
+  const toneLabels: Record<Tone, string> = getMobileCatalog(resolvedLocale).aiAssistant.tones;
 
   useEffect(() => () => controllerRef.current?.abort(), []);
   useEffect(() => {
-    if (visible) {
-      controllerRef.current?.abort();
-      setAction("summarize");
-      setTargetLanguage(getDefaultAiTargetLanguage(resolvedLocale));
-      setTone("professional");
-      setCustomInstruction("");
-      setRefineInstruction("");
-      setOutput("");
-      setError(null);
-      setGenerating(false);
-      setApplying(false);
-      setPicker(null);
-    } else {
+    if (!visible) {
       controllerRef.current?.abort();
       setPicker(null);
+      setSessionReady(false);
+      setInitializedForOpen(false);
+      return;
     }
-  }, [memo.id, resolvedLocale, visible]);
+    controllerRef.current?.abort();
+    setCustomInstruction("");
+    setRefineInstruction("");
+    setOutput("");
+    setError(null);
+    setGenerating(false);
+    setApplying(false);
+    setPicker(null);
+    setSessionReady(false);
+    setInitializedForOpen(false);
+    let cancelled = false;
+    void readMobileAiAssistantLastAction("wholeNote").then((preference) => {
+      if (cancelled) return;
+      storedPreferenceRef.current = preference;
+      setSessionReady(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [memo.id, visible]);
+
   useEffect(() => {
-    setTargetLanguage(getDefaultAiTargetLanguage(resolvedLocale));
-  }, [resolvedLocale]);
+    if (!visible || !sessionReady || initializedForOpen || promptsQuery.isLoading) return;
+    const resolved = resolveAiAssistantOpenAction({
+      hasSelection: false,
+      preference: storedPreferenceRef.current,
+      prompts,
+    });
+    setSelectedPromptId(resolved.selectedPromptId);
+    setAction(resolved.action);
+    setTargetLanguage(resolved.targetLanguage ?? getDefaultAiTargetLanguage(resolvedLocale));
+    setTone(resolved.tone ?? "professional");
+    setInitializedForOpen(true);
+  }, [initializedForOpen, prompts, promptsQuery.isLoading, resolvedLocale, sessionReady, visible]);
 
   const buildRequest = (source: string, refinement?: string) => {
     const base = {
@@ -121,15 +138,34 @@ export const MobileAiAssistantModal = ({
     if (refinement?.trim()) return { ...base, action: "custom" as const, instruction: refinement.trim() };
     return {
       ...base,
-      action,
-      ...(action === "translate" ? { targetLanguage } : {}),
-      ...(action === "change-tone" ? { tone } : {}),
-      ...(action === "custom" ? { instruction: customInstruction.trim() } : {}),
+      action: selectedPrompt?.action ?? action,
+      locale: resolvedLocale,
+      ...(selectedPrompt ? { promptId: selectedPrompt.id } : {}),
+      ...(promptNeedsTargetLanguage(parameterKind) ? { targetLanguage } : {}),
+      ...(promptNeedsTone(parameterKind) ? { tone } : {}),
+      ...(!selectedPrompt && action === "custom" ? { instruction: customInstruction.trim() } : {}),
     };
   };
 
+  const persistLastAction = (
+    nextAction: AssistantAction,
+    nextPromptId: string | null,
+    nextLanguage = targetLanguage,
+    nextTone = tone,
+  ) => {
+    const prompt = nextPromptId ? prompts.find((item) => item.id === nextPromptId) : null;
+    void writeMobileAiAssistantLastAction("wholeNote", buildAiAssistantLastActionPreference({
+      action: nextAction,
+      promptId: nextPromptId,
+      seedKey: prompt?.seedKey ?? null,
+      targetLanguage: nextLanguage,
+      tone: nextTone,
+    }));
+  };
+
   const generate = async (source = memo.contentMarkdown, refinement?: string) => {
-    if (!client || (action === "custom" && !customInstruction.trim() && !refinement?.trim())) return;
+    if (!client || (!selectedPrompt && action === "custom" && !customInstruction.trim() && !refinement?.trim())) return;
+    if (!refinement?.trim()) persistLastAction(action, selectedPromptId);
     controllerRef.current?.abort();
     const controller = new AbortController();
     controllerRef.current = controller;
@@ -148,8 +184,8 @@ export const MobileAiAssistantModal = ({
       if (controller.signal.aborted) return;
       setError(
         caught instanceof ApiRequestError && caught.code === "ai_not_configured"
-          ? tr("请先在 Web 或桌面端的“AI 集成”中配置模型。", "Configure a model in AI Integrations on the web or desktop app first.")
-          : caught instanceof Error ? caught.message : tr("AI 生成失败。", "AI generation failed.")
+          ? getMobileCatalog(resolvedLocale).mobile.ai.modelNotConfigured
+          : caught instanceof Error ? caught.message : getMobileCatalog(resolvedLocale).mobile.ai.generationFailed
       );
     } finally {
       if (controllerRef.current === controller) {
@@ -173,10 +209,10 @@ export const MobileAiAssistantModal = ({
     setError(null);
     try {
       await onApply(output, mode);
-      Alert.alert(tr("已更新笔记", "Note updated"));
+      Alert.alert(getMobileCatalog(resolvedLocale).mobile.ai.noteUpdated);
       onClose();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : tr("更新笔记失败。", "Could not update the note."));
+      setError(caught instanceof Error ? caught.message : getMobileCatalog(resolvedLocale).mobile.ai.noteUpdateFailed);
     } finally {
       setApplying(false);
     }
@@ -187,7 +223,7 @@ export const MobileAiAssistantModal = ({
   const border = dark ? "#33453d" : "#dbe4df";
   const foreground = dark ? "#e2e8f0" : "#0f172a";
   const muted = dark ? "#94a3b8" : "#64748b";
-  const actionDisabled = applying || (action === "custom" && !customInstruction.trim());
+  const actionDisabled = applying || (!selectedPrompt && action === "custom" && !customInstruction.trim());
 
   const selectField = (label: string, value: string, onPress: () => void) => (
     <View style={styles.field}>
@@ -200,7 +236,16 @@ export const MobileAiAssistantModal = ({
   );
 
   const pickerOptions = picker === "action"
-    ? actions.map((value) => ({ value, label: labels[value], active: action === value }))
+    ? (prompts.length
+      ? [
+        ...prompts.map((prompt) => ({
+          value: `${PROMPT_PREFIX}${prompt.id}`,
+          label: prompt.name,
+          active: selectedPromptId === prompt.id,
+        })),
+        { value: "custom", label: labels.custom, active: !selectedPromptId && action === "custom" },
+      ]
+      : actions.map((value) => ({ value, label: labels[value], active: !selectedPromptId && action === value })))
     : picker === "language"
       ? targetLanguages.map((value) => ({ value, label: languageLabels[value], active: targetLanguage === value }))
       : tones.map((value) => ({ value, label: toneLabels[value], active: tone === value }));
@@ -208,13 +253,23 @@ export const MobileAiAssistantModal = ({
   const choosePickerOption = (value: string) => {
     if (picker === "action") {
       controllerRef.current?.abort();
-      setAction(value as AssistantAction);
+      const promptId = value.startsWith(PROMPT_PREFIX) ? value.slice(PROMPT_PREFIX.length) : null;
+      const prompt = promptId ? prompts.find((item) => item.id === promptId) : null;
+      const nextAction = prompt?.action ?? (value as AssistantAction);
+      const nextPromptId = prompt?.id ?? null;
+      setSelectedPromptId(nextPromptId);
+      setAction(nextAction);
+      persistLastAction(nextAction, nextPromptId);
       setOutput("");
       setError(null);
     } else if (picker === "language") {
-      setTargetLanguage(value as TargetLanguage);
+      const nextLanguage = value as TargetLanguage;
+      setTargetLanguage(nextLanguage);
+      persistLastAction(action, selectedPromptId, nextLanguage);
     } else if (picker === "tone") {
-      setTone(value as Tone);
+      const nextTone = value as Tone;
+      setTone(nextTone);
+      persistLastAction(action, selectedPromptId, targetLanguage, nextTone);
     }
     setPicker(null);
   };
@@ -225,27 +280,27 @@ export const MobileAiAssistantModal = ({
         <View style={[styles.header, { borderBottomColor: border }]}>
           <View style={styles.titleRow}>
             <Sparkles color="#16A06E" size={20} />
-            <Text style={[styles.title, { color: foreground }]}>{tr("AI 笔记助手", "AI note assistant")}</Text>
+            <Text style={[styles.title, { color: foreground }]}>{getMobileCatalog(resolvedLocale).aiAssistant.title}</Text>
           </View>
-          <Pressable accessibilityLabel={tr("关闭", "Close")} accessibilityRole="button" onPress={onClose} style={styles.iconButton}>
+          <Pressable accessibilityLabel={getMobileCatalog(resolvedLocale).common.close} accessibilityRole="button" onPress={onClose} style={styles.iconButton}>
             <X color={muted} size={22} />
           </Pressable>
         </View>
         <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
           <Text style={[styles.description, { color: muted }]}>
-            {tr("选择 AI 要做的事。输出只会作为草稿，确认后才会修改笔记。", "Choose what AI should do. Output remains a draft until you apply it.")}
+            {getMobileCatalog(resolvedLocale).mobile.ai.intro}
           </Text>
-          {selectField(tr("AI 操作", "AI action"), labels[action], () => setPicker("action"))}
-          {action === "translate" ? selectField(tr("目标语言", "Target language"), languageLabels[targetLanguage], () => setPicker("language")) : null}
-          {action === "change-tone" ? selectField(tr("语气", "Tone"), toneLabels[tone], () => setPicker("tone")) : null}
-          {action === "custom" ? (
+          {selectField(getMobileCatalog(resolvedLocale).aiAssistant.actionLabel, selectedPrompt?.name ?? labels[action], () => setPicker("action"))}
+          {promptNeedsTargetLanguage(parameterKind) ? selectField(getMobileCatalog(resolvedLocale).aiAssistant.targetLanguage, languageLabels[targetLanguage], () => setPicker("language")) : null}
+          {promptNeedsTone(parameterKind) ? selectField(getMobileCatalog(resolvedLocale).aiAssistant.tone, toneLabels[tone], () => setPicker("tone")) : null}
+          {!selectedPrompt && action === "custom" ? (
             <View style={styles.field}>
-              <Text style={[styles.fieldLabel, { color: foreground }]}>{tr("告诉 AI 你想怎么处理", "Tell AI what to do")}</Text>
+              <Text style={[styles.fieldLabel, { color: foreground }]}>{getMobileCatalog(resolvedLocale).aiAssistant.customInstruction}</Text>
               <TextInput
                 maxLength={2000}
                 multiline
                 onChangeText={setCustomInstruction}
-                placeholder={tr("例如：改成适合周报的结构，保留所有数据", "For example: Restructure this for a weekly report and keep all data")}
+                placeholder={getMobileCatalog(resolvedLocale).mobile.ai.instructionPlaceholder}
                 placeholderTextColor={muted}
                 style={[styles.instructionInput, { borderColor: border, color: foreground, backgroundColor: surface }]}
                 value={customInstruction}
@@ -253,30 +308,30 @@ export const MobileAiAssistantModal = ({
             </View>
           ) : null}
           <View style={styles.resultHeader}>
-            <Text style={[styles.fieldLabel, { color: foreground }]}>{tr("AI 草稿", "AI draft")}</Text>
-            {generating ? <Text style={styles.streaming}>{tr("生成中…", "Generating…")}</Text> : null}
+            <Text style={[styles.fieldLabel, { color: foreground }]}>{getMobileCatalog(resolvedLocale).mobile.ai.draft}</Text>
+            {generating ? <Text style={styles.streaming}>{getMobileCatalog(resolvedLocale).mobile.ai.generating}</Text> : null}
           </View>
           <View style={[styles.result, { borderColor: border, backgroundColor: mutedSurface }]}>
             <Text selectable style={[styles.resultText, { color: output ? foreground : muted }]}>
-              {output || tr("生成的草稿会显示在这里。", "The generated draft will appear here.")}
+              {output || getMobileCatalog(resolvedLocale).mobile.ai.draftPlaceholder}
             </Text>
           </View>
           {output && !generating ? (
             <View style={styles.field}>
-              <Text style={[styles.fieldLabel, { color: foreground }]}>{tr("继续调整", "Refine result")}</Text>
+              <Text style={[styles.fieldLabel, { color: foreground }]}>{getMobileCatalog(resolvedLocale).mobile.ai.refineResult}</Text>
               <View style={styles.refineRow}>
                 <TextInput
                   maxLength={2000}
                   onChangeText={setRefineInstruction}
                   onSubmitEditing={refine}
-                  placeholder={tr("例如：再简洁一点", "For example: Make it more concise")}
+                  placeholder={getMobileCatalog(resolvedLocale).mobile.ai.refinePlaceholder}
                   placeholderTextColor={muted}
                   returnKeyType="send"
                   style={[styles.refineInput, { borderColor: border, color: foreground, backgroundColor: surface }]}
                   value={refineInstruction}
                 />
                 <Pressable disabled={!refineInstruction.trim()} onPress={refine} style={[styles.refineButton, !refineInstruction.trim() && styles.disabled]}>
-                  <Text style={styles.refineButtonText}>{tr("调整", "Refine")}</Text>
+                  <Text style={styles.refineButtonText}>{getMobileCatalog(resolvedLocale).aiAssistant.refineAction}</Text>
                 </Pressable>
               </View>
             </View>
@@ -287,24 +342,28 @@ export const MobileAiAssistantModal = ({
           <View style={styles.footerRow}>
             <Pressable disabled={!output || generating} onPress={() => void Clipboard.setStringAsync(output)} style={[styles.secondaryButton, { borderColor: border }, (!output || generating) && styles.disabled]}>
               <Copy color={foreground} size={16} />
-              <Text style={[styles.secondaryText, { color: foreground }]}>{tr("复制", "Copy")}</Text>
+              <Text style={[styles.secondaryText, { color: foreground }]}>{getMobileCatalog(resolvedLocale).mobile.ai.copy}</Text>
             </Pressable>
-            <Pressable disabled={!output || generating || applying} onPress={() => void apply("append")} style={[styles.secondaryButton, { borderColor: border }, (!output || generating || applying) && styles.disabled]}>
-              <Text style={[styles.secondaryText, { color: foreground }]}>{tr("追加", "Append")}</Text>
-            </Pressable>
-            <Pressable disabled={!output || generating || applying} onPress={() => void apply("replace")} style={[styles.secondaryButton, { borderColor: border }, (!output || generating || applying) && styles.disabled]}>
-              <Text style={[styles.secondaryText, { color: foreground }]}>{tr("替换", "Replace")}</Text>
-            </Pressable>
+            {promptAllowsAppend(resultMode) ? (
+              <Pressable disabled={!output || generating || applying} onPress={() => void apply("append")} style={[styles.secondaryButton, { borderColor: border }, (!output || generating || applying) && styles.disabled]}>
+                <Text style={[styles.secondaryText, { color: foreground }]}>{getMobileCatalog(resolvedLocale).mobile.ai.append}</Text>
+              </Pressable>
+            ) : null}
+            {promptAllowsReplace(resultMode) ? (
+              <Pressable disabled={!output || generating || applying} onPress={() => void apply("replace")} style={[styles.secondaryButton, { borderColor: border }, (!output || generating || applying) && styles.disabled]}>
+                <Text style={[styles.secondaryText, { color: foreground }]}>{getMobileCatalog(resolvedLocale).mobile.ai.replace}</Text>
+              </Pressable>
+            ) : null}
           </View>
           {generating ? (
             <Pressable onPress={() => controllerRef.current?.abort()} style={styles.primaryButton}>
               <Square color="#ffffff" size={14} />
-              <Text style={styles.primaryText}>{tr("停止", "Stop")}</Text>
+              <Text style={styles.primaryText}>{getMobileCatalog(resolvedLocale).aiAssistant.stop}</Text>
             </Pressable>
           ) : (
             <Pressable disabled={actionDisabled} onPress={() => void generate()} style={[styles.primaryButton, actionDisabled && styles.disabled]}>
               {output ? <RefreshCw color="#ffffff" size={16} /> : null}
-              <Text style={styles.primaryText}>{output ? tr("重新生成", "Regenerate") : tr("生成", "Generate")}</Text>
+              <Text style={styles.primaryText}>{output ? getMobileCatalog(resolvedLocale).mobile.ai.regenerate : getMobileCatalog(resolvedLocale).aiAssistant.generate}</Text>
             </Pressable>
           )}
         </View>
@@ -312,7 +371,7 @@ export const MobileAiAssistantModal = ({
           <Pressable onPress={() => setPicker(null)} style={styles.pickerBackdrop}>
             <View style={[styles.pickerSheet, { backgroundColor: surface }]}>
               <Text style={[styles.pickerTitle, { color: foreground }]}>
-                {picker === "action" ? tr("选择 AI 操作", "Choose AI action") : picker === "language" ? tr("选择目标语言", "Choose target language") : tr("选择语气", "Choose tone")}
+                {picker === "action" ? getMobileCatalog(resolvedLocale).mobile.ai.chooseAction : picker === "language" ? getMobileCatalog(resolvedLocale).mobile.ai.chooseTargetLanguage : getMobileCatalog(resolvedLocale).mobile.ai.chooseTone}
               </Text>
               <ScrollView style={styles.pickerScroll}>
                 {pickerOptions.map((option) => (

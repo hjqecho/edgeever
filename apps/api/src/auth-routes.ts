@@ -59,7 +59,12 @@ type AuthRouteDependencies = {
   authenticateRequest: (context: AppContext, touch: boolean) => Promise<AuthContext | null>;
   authenticateSession: (context: AppContext, touch: boolean) => Promise<AuthContext | null>;
   createSession: (context: AppContext, user: UserRow, requestedDeviceId?: string) => Promise<LoginSession>;
-  ensureUserWorkspace: (database: DatabaseAdapter, userId: string, username: string) => Promise<UserWorkspace>;
+  ensureUserWorkspace: (
+    database: DatabaseAdapter,
+    userId: string,
+    username: string,
+    locale?: string | null,
+  ) => Promise<UserWorkspace>;
   getBearerToken: (context: AppContext) => string | null;
   getInstanceAuthMode: (environment: Bindings) => Promise<InstanceAuthMode>;
   getLoginAttemptKeys: (context: AppContext, username: string) => Promise<LoginAttemptKey[]>;
@@ -269,10 +274,16 @@ export const registerAuthRoutes = (
     }
 
     await clearLoginAttempts(context.env.storage.db, loginAttemptKeys);
+    if (dependencies.isDemoEnvironment(context.env)) {
+      // The demo keeps its own bilingual seed; a visitor's sign-in must not
+      // localize the shared notebooks into that visitor's language.
+      await context.env.storage.db.prepare(`DELETE FROM workspace_seed_localizations`).run();
+    }
     const workspace = await dependencies.ensureUserWorkspace(
       context.env.storage.db,
       user.id,
       user.username,
+      input.locale ?? context.req.header("accept-language"),
     );
     const session = await dependencies.createSession(context, user, input.deviceId);
     dependencies.setSessionCookie(context, session.token, session.maxAge);
@@ -305,7 +316,7 @@ export const registerAuthRoutes = (
     "/api/v1/auth/change-password",
     zValidator("json", ChangePasswordSchema),
     async (context) => {
-      const auth = await requireInteractiveSession(context, dependencies.authenticateSession);
+      const auth = await requireInteractiveSession(context, dependencies.authenticateRequest);
       if (!auth) return unauthorized(context, "An interactive user session is required.");
       if (dependencies.isDemoMode(context.env)) {
         return forbidden(context, "The demo environment does not allow changing login passwords.");

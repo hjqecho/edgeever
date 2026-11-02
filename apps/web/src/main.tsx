@@ -1,21 +1,43 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import React from "react";
+import React, { useEffect } from "react";
 import { createRoot } from "react-dom/client";
-import { BrowserRouter } from "react-router";
+import { BrowserRouter, HashRouter } from "react-router";
 import { registerSW } from "virtual:pwa-register";
 import { App } from "./app/App";
-import "./i18n";
-import { emitPwaUpdateNotice, markPwaUpdateReloadPending } from "./lib/pwa-update-notice";
+import { bootstrapI18n } from "./i18n";
+import { emitPwaUpdateNotice } from "./lib/pwa-update-notice";
+import { withEnvironmentTitlePrefix } from "./lib/environment-title";
 import { initializeTheme, ThemeProvider } from "./components/ThemeProvider";
+import { installPhoneImageFillStyle } from "@edgeever/shared/image-display";
+import { installDesktopClipboardBridge } from "./lib/clipboard";
+import { applyEditorBodyFontPreference } from "./lib/editor-body-font";
+import { installEditorBodyFontFaces } from "./lib/editor-body-font-faces";
+import { applyUiFontPreference } from "./lib/ui-font";
+import { DesktopRendererErrorBoundary } from "./components/DesktopRendererErrorBoundary";
+import { reportDesktopRendererReadyAfterPaint } from "./lib/desktop-renderer-ready";
 import "./styles/globals.css";
+import "./styles/editor-body-fonts.css";
+
+installPhoneImageFillStyle();
+installDesktopClipboardBridge();
 
 const PWA_UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1_000;
 const DEVELOPMENT_PWA_RELOAD_KEY = "edgeever.dev-pwa-reset";
+const isDesktopRenderer = __EDGEEVER_DESKTOP_BUILD__ || window.edgeeverDesktop?.isAvailable === true;
 
-if (import.meta.env.DEV && __EDGEEVER_DEVELOPMENT_PROFILE__) {
-  document.documentElement.dataset.edgeeverEnvironment = __EDGEEVER_DEVELOPMENT_PROFILE__;
-  const environmentLabel = __EDGEEVER_DEVELOPMENT_PROFILE__ === "demo" ? "LOCAL DEMO" : "LOCAL";
-  document.title = `[${environmentLabel}] ${document.title}`;
+const DesktopBootstrapReady = () => {
+  useEffect(() => reportDesktopRendererReadyAfterPaint(), []);
+  return null;
+};
+
+if (import.meta.env.DEV) {
+  if (__EDGEEVER_DEVELOPMENT_PROFILE__) {
+    document.documentElement.dataset.edgeeverEnvironment = __EDGEEVER_DEVELOPMENT_PROFILE__;
+  }
+  document.title = withEnvironmentTitlePrefix(document.title, {
+    development: true,
+    profile: __EDGEEVER_DEVELOPMENT_PROFILE__,
+  });
 }
 
 const clearDevelopmentPwaState = async () => {
@@ -55,11 +77,10 @@ const registerProductionServiceWorker = () => {
   updateServiceWorker = registerSW({
     immediate: true,
     onNeedRefresh() {
-      emitPwaUpdateNotice({ buildLabel: __EDGEEVER_BUILD_LABEL__, kind: "checking" });
+      emitPwaUpdateNotice({ kind: "checking" });
       void updateServiceWorker(true);
     },
     onNeedReload() {
-      markPwaUpdateReloadPending();
       window.location.reload();
     },
     onRegisteredSW(_swScriptUrl, registration) {
@@ -101,6 +122,11 @@ const mountApp = () => {
   }
 
   initializeTheme();
+  installDesktopClipboardBridge();
+  installEditorBodyFontFaces();
+  applyEditorBodyFontPreference();
+  applyUiFontPreference();
+  const Router = isDesktopRenderer ? HashRouter : BrowserRouter;
 
   createRoot(root, {
     onUncaughtError(error, errorInfo) {
@@ -108,24 +134,28 @@ const mountApp = () => {
     },
   }).render(
     <React.StrictMode>
-      <QueryClientProvider client={queryClient}>
-        <ThemeProvider>
-          <BrowserRouter>
-            <App />
-          </BrowserRouter>
-        </ThemeProvider>
-      </QueryClientProvider>
+      <DesktopRendererErrorBoundary>
+        <DesktopBootstrapReady />
+        <QueryClientProvider client={queryClient}>
+          <ThemeProvider>
+            <Router>
+              <App />
+            </Router>
+          </ThemeProvider>
+        </QueryClientProvider>
+      </DesktopRendererErrorBoundary>
     </React.StrictMode>
   );
 };
 
 const bootstrap = async () => {
+  await bootstrapI18n();
   if (import.meta.env.DEV) {
     const reloading = await clearDevelopmentPwaState();
     if (reloading) {
       return;
     }
-  } else {
+  } else if (!isDesktopRenderer) {
     registerProductionServiceWorker();
   }
 

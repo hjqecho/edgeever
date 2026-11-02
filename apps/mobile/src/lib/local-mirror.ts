@@ -1,14 +1,23 @@
 import type { createEdgeEverClient, ListMemosResponse, MemoFilterMode, MemoSortMode } from "@edgeever/client";
-import type { MemoDetail, MemoSummary, Notebook } from "@edgeever/shared";
+import {
+  hasSyncStateReset,
+  isSyncMetadataInitialized,
+  splitSyncBootstrapWriteBatches,
+  type MemoDetail,
+  type MemoSummary,
+  type Notebook,
+  type TagSummary,
+} from "@edgeever/shared";
 import * as SQLite from "expo-sqlite";
-import { hasMobileSyncCursorRewound, hasMobileSyncIdentityChanged, isMobileSyncMetadataInitialized, splitMobileBootstrapWriteBatches } from "./mobile-sync-protocol";
+import { serializeMobileDatabaseWrites } from "./mobile-database-access";
+import { filterLocalMemosByExactTag, summarizeMobileTags } from "./mobile-tags";
 
 const DATABASE_NAME = "edgeever-mobile.db";
 const BOOTSTRAP_PAGE_SIZE = 200;
 const BOOTSTRAP_WRITE_BATCH_SIZE = 50;
 const CHANGE_PAGE_SIZE = 200;
 
-let databasePromise: Promise<SQLite.SQLiteDatabase> | null = null;
+let databasePromise: Promise<ReturnType<typeof serializeMobileDatabaseWrites>> | null = null;
 const syncPromises = new Map<string, Promise<number>>();
 
 type StoredMemoRow = { data_json: string };
@@ -21,6 +30,7 @@ export type LocalMemoListParams = {
   notebookId?: string | null;
   notebookIds?: string[];
   q?: string;
+  tag?: string;
   trash?: boolean;
   sort?: MemoSortMode;
   filter?: MemoFilterMode;
@@ -49,7 +59,7 @@ export const isMobileLocalMirrorInitialized = async (scope: string) => {
   const metadata = new Map(rows.map((row) => [row.key, row.value]));
   const cursorValue = metadata.get("cursor");
   const identityValue = metadata.get("identity");
-  return isMobileSyncMetadataInitialized(cursorValue, identityValue);
+  return isSyncMetadataInitialized(cursorValue, identityValue);
 };
 
 export const listLocalNotebooks = async (scope: string): Promise<{ notebooks: Notebook[] }> => {
@@ -73,6 +83,27 @@ export const listLocalNotebooks = async (scope: string): Promise<{ notebooks: No
       lastMemoUpdatedAt: row.last_memo_updated_at,
     })),
   };
+};
+
+export const upsertLocalNotebook = async (scope: string, notebook: Notebook) => {
+  const db = await getDatabase();
+  await upsertNotebook(db, scope, notebook);
+};
+
+export const listLocalTags = async (scope: string): Promise<{ tags: TagSummary[] }> => {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<StoredMemoRow>(
+    "SELECT data_json FROM mobile_memos WHERE scope = ? AND is_deleted = 0",
+    scope
+  );
+  const memos = rows.flatMap((row) => {
+    try {
+      return [JSON.parse(row.data_json) as MemoDetail];
+    } catch {
+      return [];
+    }
+  });
+  return { tags: summarizeMobileTags(memos) };
 };
 
 export const listLocalMemos = async (scope: string, params: LocalMemoListParams): Promise<ListMemosResponse> => {
@@ -106,15 +137,43 @@ export const listLocalMemos = async (scope: string, params: LocalMemoListParams)
       ? "is_pinned DESC, created_at DESC, id DESC"
       : params.sort === "title-asc"
         ? "is_pinned DESC, title COLLATE NOCASE ASC, updated_at DESC, id DESC"
-        : "is_pinned DESC, updated_at DESC, id DESC";
-  const countRow = await db.getFirstAsync<{ count: number }>(
-    `SELECT COUNT(*) AS count FROM mobile_memos WHERE ${conditions.join(" AND ")}`,
-    ...binds
-  );
+        : params.sort === "title-desc"
+          ? "is_pinned DESC, title COLLATE NOCASE DESC, updated_at DESC, id DESC"
+          : "is_pinned DESC, updated_at DESC, id DESC";
+  const tag = params.tag?.trim() ?? "";
   const limit = params.limit ?? 50;
   const offset = Math.max(0, params.offset ?? 0);
+  const whereSql = conditions.join(" AND ");
+
+  if (tag) {
+    const rows = await db.getAllAsync<StoredMemoRow>(
+      `SELECT data_json FROM mobile_memos WHERE ${whereSql} ORDER BY ${orderBy}`,
+      ...binds
+    );
+    const memos = filterLocalMemosByExactTag(
+      rows.flatMap((row) => {
+        try {
+          return [toMemoSummary(JSON.parse(row.data_json) as MemoDetail)];
+        } catch {
+          return [];
+        }
+      }),
+      tag
+    );
+    const page = memos.slice(offset, offset + limit);
+    return {
+      memos: page,
+      totalCount: memos.length,
+      nextCursor: offset + page.length < memos.length ? String(offset + page.length) : null,
+    };
+  }
+
+  const countRow = await db.getFirstAsync<{ count: number }>(
+    `SELECT COUNT(*) AS count FROM mobile_memos WHERE ${whereSql}`,
+    ...binds
+  );
   const rows = await db.getAllAsync<StoredMemoRow>(
-    `SELECT data_json FROM mobile_memos WHERE ${conditions.join(" AND ")} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+    `SELECT data_json FROM mobile_memos WHERE ${whereSql} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
     ...binds,
     limit,
     offset
@@ -231,6 +290,7 @@ const performMobileLocalMirrorSync = async (
     let afterId: string | null = null;
     let loadedCount = 0;
     let snapshotCursor = 0;
+    let snapshotTotalCount = 0;
     let snapshotIdentity = "legacy";
     await db.withExclusiveTransactionAsync(async (tx) => {
       await tx.runAsync(`DELETE FROM mobile_notebooks WHERE scope = ?`, scope);
@@ -243,9 +303,10 @@ const performMobileLocalMirrorSync = async (
       const page = await client.getMobileSyncBootstrapPage(afterId, BOOTSTRAP_PAGE_SIZE);
       if (afterId === null) {
         snapshotCursor = page.snapshotCursor;
+        snapshotTotalCount = page.totalCount ?? 0;
         snapshotIdentity = page.syncIdentity || "legacy";
       }
-      const writeBatches = splitMobileBootstrapWriteBatches(page.memos, BOOTSTRAP_WRITE_BATCH_SIZE);
+      const writeBatches = splitSyncBootstrapWriteBatches(page.memos, BOOTSTRAP_WRITE_BATCH_SIZE);
       for (const [batchIndex, memos] of writeBatches.entries()) {
         await db.withExclusiveTransactionAsync(async (tx) => {
           if (batchIndex === 0) {
@@ -258,7 +319,7 @@ const performMobileLocalMirrorSync = async (
           }
         });
         loadedCount += memos.length;
-        await options.onBootstrapProgress?.({ loadedCount, totalCount: page.totalCount });
+        await options.onBootstrapProgress?.({ loadedCount, totalCount: page.totalCount ?? snapshotTotalCount });
       }
       if (page.nextAfterId === null) {
         break;
@@ -273,7 +334,10 @@ const performMobileLocalMirrorSync = async (
 
   while (true) {
     const page = await client.getMobileSyncChanges(cursor, CHANGE_PAGE_SIZE);
-    if (hasMobileSyncCursorRewound(cursor, page.serverCursor) || hasMobileSyncIdentityChanged(syncIdentity, page.syncIdentity)) {
+    if (hasSyncStateReset(
+      { cursor, syncIdentity },
+      { serverCursor: page.serverCursor, syncIdentity: page.syncIdentity },
+    )) {
       // A restored/replaced server database can legitimately restart its
       // change sequence. Rebuild the mirror instead of treating the stale
       // local cursor as proof that no remote notes exist.
@@ -327,12 +391,12 @@ const getDatabase = async () => {
         PRIMARY KEY (scope, temporary_id)
       );
     `);
-    return db;
+    return serializeMobileDatabaseWrites(db);
   });
   return databasePromise;
 };
 
-const upsertNotebook = (db: SQLite.SQLiteDatabase, scope: string, notebook: Notebook) =>
+const upsertNotebook = (db: Pick<SQLite.SQLiteDatabase, "runAsync">, scope: string, notebook: Notebook) =>
   db.runAsync(
     `INSERT OR REPLACE INTO mobile_notebooks (scope, id, name, sort_order, data_json) VALUES (?, ?, ?, ?, ?)`,
     scope,
@@ -342,7 +406,7 @@ const upsertNotebook = (db: SQLite.SQLiteDatabase, scope: string, notebook: Note
     JSON.stringify(notebook)
   );
 
-const upsertMemo = (db: SQLite.SQLiteDatabase, scope: string, memo: MemoDetail) =>
+const upsertMemo = (db: Pick<SQLite.SQLiteDatabase, "runAsync">, scope: string, memo: MemoDetail) =>
   db.runAsync(
     `INSERT OR REPLACE INTO mobile_memos
       (scope, id, notebook_id, title, content_text, tags_text, is_pinned, is_deleted, created_at, updated_at, deleted_at, data_json)
@@ -361,14 +425,14 @@ const upsertMemo = (db: SQLite.SQLiteDatabase, scope: string, memo: MemoDetail) 
     JSON.stringify(memo)
   );
 
-const setCursor = (db: SQLite.SQLiteDatabase, scope: string, cursor: number) =>
+const setCursor = (db: Pick<SQLite.SQLiteDatabase, "runAsync">, scope: string, cursor: number) =>
   db.runAsync(
     `INSERT OR REPLACE INTO mobile_sync_meta (scope, key, value) VALUES (?, 'cursor', ?)`,
     scope,
     String(cursor)
   );
 
-const setSyncIdentity = (db: SQLite.SQLiteDatabase, scope: string, identity: string) =>
+const setSyncIdentity = (db: Pick<SQLite.SQLiteDatabase, "runAsync">, scope: string, identity: string) =>
   db.runAsync(
     `INSERT OR REPLACE INTO mobile_sync_meta (scope, key, value) VALUES (?, 'identity', ?)`,
     scope,

@@ -2,29 +2,17 @@ import XCTest
 @testable import EdgeEver
 
 final class MemoTemplatesTests: XCTestCase {
-    func testBuiltInCatalogHasSixItemsBothLocales() {
-        let zh = BuiltInMemoTemplates.all(isEnglish: false)
-        let en = BuiltInMemoTemplates.all(isEnglish: true)
-        XCTAssertEqual(zh.count, 6)
-        XCTAssertEqual(en.count, 6)
-        XCTAssertEqual(zh[0].name, "灵感速记")
-        XCTAssertEqual(en[0].name, "Quick Spark")
-        XCTAssertTrue(zh[1].contentMarkdown.contains("会议纪要"))
-        XCTAssertTrue(en[1].contentMarkdown.contains("Meeting Minutes"))
-        XCTAssertEqual(zh[0].source, .builtin)
-        XCTAssertEqual(zh[0].tags, ["template", "quick-note"])
-    }
-
     func testCreateSeedFromSelectableTemplate() {
-        let template = SelectableMemoTemplate(
+        let template = SelectableMemoTemplate(MemoTemplate(
             id: "tpl",
             name: "我的周报",
             description: "desc",
             title: "【周报】",
             contentMarkdown: "## 本周",
             tags: ["work", "weekly"],
-            source: .saved
-        )
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z"
+        ))
         XCTAssertEqual(template.createSeed.title, "【周报】")
         XCTAssertEqual(template.createSeed.contentMarkdown, "## 本周")
         XCTAssertEqual(template.createSeed.tagsText, "work, weekly")
@@ -44,9 +32,18 @@ final class MemoTemplatesTests: XCTestCase {
             createdAt: "2026-01-01T00:00:00.000Z",
             updatedAt: "2026-01-01T00:00:00.000Z"
         )
-        let row = BuiltInMemoTemplates.fromSaved(saved)
-        XCTAssertEqual(row.source, .saved)
+        let row = SelectableMemoTemplate(saved)
         XCTAssertEqual(row.title, "自定义")
         XCTAssertEqual(row.contentMarkdown, "# Hi")
+    }
+
+    func testGalleryEntryBecomesCreateSeed() throws {
+        let json = #"{"templates":[{"key":"daily-journal","name":"Dziennik dnia","description":"Opis","title":"Dziennik dnia","contentMarkdown":"- Plan","tags":["template","daily-journal"]}]}"#
+        let response = try EdgeEverJSON.decoder.decode(TemplateGalleryResponse.self, from: Data(json.utf8))
+        let row = SelectableMemoTemplate(try XCTUnwrap(response.templates.first))
+        XCTAssertEqual(row.id, "gallery:daily-journal")
+        XCTAssertEqual(row.createSeed.title, "Dziennik dnia")
+        XCTAssertEqual(row.createSeed.contentMarkdown, "- Plan")
+        XCTAssertEqual(row.createSeed.tagsText, "template, daily-journal")
     }
 }

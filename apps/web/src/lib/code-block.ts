@@ -1,13 +1,41 @@
-import { common, createLowlight } from "lowlight";
+import { createCodeBlockLowlight } from "./code-block-highlighting";
 import CodeBlockLowlight from "@tiptap/extension-code-block-lowlight";
+import type { Editor } from "@tiptap/core";
 import { ReactNodeViewRenderer } from "@tiptap/react";
 import { MermaidCodeBlock } from "@/components/MermaidCodeBlock";
+import { NoteProperties } from "@/components/editor/NoteProperties";
+import { FRONT_MATTER_LANGUAGE } from "@edgeever/shared";
+import { createElement } from "react";
 
-export const codeBlockLowlight = createLowlight(common);
+export const codeBlockLowlight = createCodeBlockLowlight();
+
+export const selectCurrentCodeBlockContent = (editor: Editor) => {
+  const { $from, $to, from, to } = editor.state.selection;
+  if ($from.parent !== $to.parent || $from.parent.type.name !== "codeBlock") {
+    return false;
+  }
+
+  const blockFrom = $from.start();
+  const blockTo = $from.end();
+  if (from === blockFrom && to === blockTo) {
+    return false;
+  }
+
+  return editor.commands.setTextSelection({ from: blockFrom, to: blockTo });
+};
 
 export const EdgeEverCodeBlock = CodeBlockLowlight.extend({
+  addKeyboardShortcuts() {
+    return {
+      ...this.parent?.(),
+      "Mod-a": () => selectCurrentCodeBlockContent(this.editor),
+    };
+  },
+
   addNodeView() {
-    return ReactNodeViewRenderer(MermaidCodeBlock);
+    return ReactNodeViewRenderer((props) => createElement(
+      props.node.attrs.language === FRONT_MATTER_LANGUAGE ? NoteProperties : MermaidCodeBlock, props,
+    ));
   },
 });
 

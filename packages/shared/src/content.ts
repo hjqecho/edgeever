@@ -1,20 +1,33 @@
-import Image from "@tiptap/extension-image";
-import { TaskItem, TaskList } from "@tiptap/extension-list";
-import { TableKit } from "@tiptap/extension-table";
-import { Markdown, MarkdownManager } from "@tiptap/markdown";
-import StarterKit from "@tiptap/starter-kit";
-import { MergeDivider, MERGE_DIVIDER_NODE_TYPE } from "./merge-divider";
+import { MarkdownManager } from "@tiptap/markdown";
+import {
+  createEdgeEverDocumentExtensions,
+  type CreateEdgeEverDocumentExtensionsOptions,
+} from "./document-extensions";
+import { MERGE_DIVIDER_NODE_TYPE } from "./merge-divider";
+import { DEFAULT_MEMO_TITLE } from "./memo-title";
+import { PDF_ATTACHMENT_NODE_TYPE, upgradeStandalonePdfLinks } from "./pdf-attachment";
+import { FILE_ATTACHMENT_NODE_TYPE, upgradeStandaloneFileLinks } from "./file-attachment";
 import {
   BLOCK_MATH_NODE_TYPE,
-  createEdgeEverMathematics,
+  createEdgeEverMarkdownMathematics,
   INLINE_MATH_NODE_TYPE,
-} from "./mathematics";
+} from "./mathematics-markdown";
+import { projectNativeUnknownContentForMarkdown } from "./mobile-content-compatibility";
+import { PLUGIN_EMBED_NODE_TYPE } from "./plugin-embed";
+import { NEW_IMAGE_WIDTH_PERCENT, parseImageWidth } from "./image-display";
+import { IMAGE_GALLERY_NODE_TYPE, groupConsecutiveImagesIntoGalleries, normalizeImageGalleries, prepareImageListsForMarkdown } from "./image-gallery";
+import { EMPTY_EXTERNAL_LINK_NODE_TYPE } from "./empty-external-link";
+import { FRONT_MATTER_LANGUAGE, createFrontMatterNode, getFrontMatterSource, splitMarkdownFrontMatter } from "./front-matter";
+import { splitMarkdownParseChunks } from "./markdown-block-start";
+import { createEdgeEverMarked } from "./markdown-options";
+
+export { PluginEmbed, PLUGIN_EMBED_NODE_TYPE, pluginEmbedToMarkdown, normalizePluginEmbedAttributes } from "./plugin-embed";
+export type { PluginEmbedAttributes } from "./plugin-embed";
 
 export {
   BLOCK_MATH_NODE_TYPE,
-  createEdgeEverMathematics,
   INLINE_MATH_NODE_TYPE,
-} from "./mathematics";
+} from "./mathematics-markdown";
 
 export {
   MergeDivider,
@@ -23,6 +36,26 @@ export {
   mergeMemoDocs,
   createMergeDividerNode,
 } from "./merge-divider";
+
+export {
+  PdfAttachment,
+  PDF_ATTACHMENT_NODE_TYPE,
+  PDF_DISPLAY_MODES,
+  isPdfAttachment,
+  resolvePdfDisplayMode,
+  upgradeStandalonePdfLinks,
+} from "./pdf-attachment";
+export type { PdfDisplayMode } from "./pdf-attachment";
+
+export {
+  FileAttachment,
+  FILE_ATTACHMENT_NODE_TYPE,
+  FILE_DISPLAY_MODES,
+  isFileAttachmentLink,
+  resolveFileDisplayMode,
+  upgradeStandaloneFileLinks,
+} from "./file-attachment";
+export type { FileDisplayMode } from "./file-attachment";
 
 export type TiptapTextNode = {
   type: "text";
@@ -46,7 +79,7 @@ export type TiptapDoc = {
   content: TiptapNode[];
 };
 
-export const DEFAULT_MEMO_TITLE = "无标题笔记";
+export { DEFAULT_MEMO_TITLE, getMemoDisplayTitle } from "./memo-title";
 
 export const resolveMergedMemoTitle = (
   inputTitle: string | null | undefined,
@@ -69,27 +102,69 @@ export const emptyDoc = (): TiptapDoc => ({
   content: [{ type: "paragraph" }],
 });
 
-const markdownManager = new MarkdownManager({
-  extensions: [
-    StarterKit,
-    TaskList,
-    TaskItem.configure({ nested: true }),
-    TableKit,
-    Image,
-    MergeDivider,
-    ...createEdgeEverMathematics(),
-    Markdown.configure({
-      markedOptions: { gfm: true },
-    }),
-  ],
+export const createEdgeEverMarkdownManager = (
+  options: CreateEdgeEverDocumentExtensionsOptions,
+) => new MarkdownManager({
+  marked: createEdgeEverMarked(),
+  extensions: createEdgeEverDocumentExtensions({
+    ...options,
+    markdown: true,
+  }),
 });
 
+const markdownManager = createEdgeEverMarkdownManager({
+  mathematics: createEdgeEverMarkdownMathematics(),
+});
+
+const PROTECTED_MARKDOWN_SEGMENT = /(```[\s\S]*?```|~~~[\s\S]*?~~~|\$\$[\s\S]*?\$\$)/g;
+
+/**
+ * CommonMark treats one or more blank lines as a single paragraph break, so two
+ * visual blank lines disappear on parse. Expand those extra newlines into the
+ * empty-paragraph spacing TipTap already understands, without touching fenced
+ * code or display-math blocks.
+ */
+const expandExtraBlankLinesForParse = (markdown: string) =>
+  markdown.split(PROTECTED_MARKDOWN_SEGMENT).map((segment) => {
+    if (segment.startsWith("```") || segment.startsWith("~~~") || segment.startsWith("$$")) {
+      return segment;
+    }
+    return segment.replace(/\n{3,}/g, (run) => "\n\n".repeat(run.length - 1));
+  }).join("");
+
+const withDefaultImageWidths = (node: TiptapNode): TiptapNode => {
+  const content = node.content?.map((child) => (
+    child.type === "text" ? child : withDefaultImageWidths(child)
+  ));
+  const next = content ? { ...node, content } : node;
+  if (next.type !== "image" || parseImageWidth(next.attrs?.width) != null) return next;
+  return { ...next, attrs: { ...next.attrs, width: NEW_IMAGE_WIDTH_PERCENT } };
+};
+
+// Long notes are split into pieces. marked otherwise copies the rest of the
+// note after every paragraph, and that copy blocks the single-threaded server.
+const parseMarkdownBody = (markdown: string): TiptapNode[] => {
+  const chunks = splitMarkdownParseChunks(markdown);
+  if (chunks.length <= 1) {
+    return (markdownManager.parse(markdown) as TiptapDoc).content ?? [];
+  }
+  return chunks.flatMap((chunk) => (markdownManager.parse(chunk) as TiptapDoc).content ?? []);
+};
+
 export const markdownToDoc = (markdown: string): TiptapDoc => {
-  if (!markdown.trim()) {
+  const normalized = markdown.replace(/\r\n?/g, "\n");
+  if (!normalized) {
     return emptyDoc();
   }
 
-  return markdownManager.parse(markdown.replace(/\r\n?/g, "\n")) as TiptapDoc;
+  const header = splitMarkdownFrontMatter(normalized);
+  const content = parseMarkdownBody(expandExtraBlankLinesForParse(header?.body ?? normalized));
+  return {
+    type: "doc",
+    content: [...(header ? [createFrontMatterNode(header.source)] : []),
+      ...groupConsecutiveImagesIntoGalleries(content.map(withDefaultImageWidths)),
+      ...(header && !content.length ? [{ type: "paragraph" }] : [])],
+  };
 };
 
 const docContainsNodeType = (doc: TiptapDoc, nodeType: string): boolean => {
@@ -98,6 +173,22 @@ const docContainsNodeType = (doc: TiptapDoc, nodeType: string): boolean => {
   );
 
   return visit(doc.content);
+};
+
+/** Upgrade only explicit math fences in older JSON, retaining rich-only content. */
+const upgradeMathCodeFences = (doc: TiptapDoc): TiptapDoc => {
+  const visit = (node: TiptapNode): TiptapNode => {
+    if (node.type === "codeBlock" && node.attrs?.language === "math"
+      && node.content?.every((child) => child.type === "text")) {
+      const latex = node.content.map((child) => (child as TiptapTextNode).text).join("").trim();
+      if (latex) return { type: BLOCK_MATH_NODE_TYPE, attrs: { latex } };
+    }
+    if (!node.content) return node;
+    const content = node.content.map(visit);
+    return content.some((child, index) => child !== node.content?.[index]) ? { ...node, content } : node;
+  };
+  const content = doc.content.map(visit);
+  return content.some((node, index) => node !== doc.content[index]) ? { ...doc, content } : doc;
 };
 
 /**
@@ -111,21 +202,34 @@ export const resolveMemoContentDoc = (
   contentMarkdown: string | null | undefined
 ): TiptapDoc => {
   const currentDoc = contentJson && Array.isArray(contentJson.content)
-    ? upgradeLegacyAttachmentLinks(contentJson)
+    ? upgradeMathCodeFences(normalizeImageGalleries(
+        upgradeStandaloneFileLinks(upgradeStandalonePdfLinks(upgradeLegacyAttachmentLinks(contentJson))),
+      ))
     : emptyDoc();
+  if (getFrontMatterSource(currentDoc) !== null) return currentDoc;
   if (
     !contentMarkdown?.trim() ||
     docContainsNodeType(currentDoc, "table") ||
     docContainsNodeType(currentDoc, "taskList") ||
     docContainsNodeType(currentDoc, "edgeeverThemeBlock") ||
+    docContainsNodeType(currentDoc, IMAGE_GALLERY_NODE_TYPE) ||
     docContainsNodeType(currentDoc, MERGE_DIVIDER_NODE_TYPE) ||
+    docContainsNodeType(currentDoc, PLUGIN_EMBED_NODE_TYPE) ||
     docContainsNodeType(currentDoc, BLOCK_MATH_NODE_TYPE) ||
     docContainsNodeType(currentDoc, INLINE_MATH_NODE_TYPE)
+    || docContainsNodeType(currentDoc, PDF_ATTACHMENT_NODE_TYPE)
+    || docContainsNodeType(currentDoc, FILE_ATTACHMENT_NODE_TYPE)
+    || docContainsNodeType(currentDoc, EMPTY_EXTERNAL_LINK_NODE_TYPE)
+    || docContainsNodeType(currentDoc, "details")
   ) {
     return currentDoc;
   }
 
   const markdownDoc = markdownToDoc(contentMarkdown);
+  const properties = getFrontMatterSource(markdownDoc);
+  if (properties !== null) {
+    return !docToText(currentDoc) ? markdownDoc : { ...currentDoc, content: [createFrontMatterNode(properties), ...currentDoc.content] };
+  }
   // Some older saves left an empty JSON document behind while retaining the
   // real body in Markdown. Treat that as a compatibility case too; otherwise
   // the editor can show the Markdown body while list excerpts see an empty
@@ -136,6 +240,8 @@ export const resolveMemoContentDoc = (
     || docContainsNodeType(markdownDoc, MERGE_DIVIDER_NODE_TYPE)
     || docContainsNodeType(markdownDoc, BLOCK_MATH_NODE_TYPE)
     || docContainsNodeType(markdownDoc, INLINE_MATH_NODE_TYPE)
+    || docContainsNodeType(markdownDoc, EMPTY_EXTERNAL_LINK_NODE_TYPE)
+    || docContainsNodeType(markdownDoc, "details")
     || !docToText(currentDoc)
     ? markdownDoc
     : currentDoc;
@@ -191,6 +297,8 @@ export const docToText = (doc: unknown): string => {
 
     const current = node as { type?: unknown; text?: unknown; attrs?: Record<string, unknown>; content?: unknown };
 
+    if (current.type === "codeBlock" && current.attrs?.language === FRONT_MATTER_LANGUAGE) return;
+
     if (typeof current.text === "string") {
       pieces.push(current.text);
     }
@@ -204,6 +312,11 @@ export const docToText = (doc: unknown): string => {
       if (label) {
         pieces.push(label);
       }
+    }
+
+    if (current.type === PDF_ATTACHMENT_NODE_TYPE || current.type === FILE_ATTACHMENT_NODE_TYPE) {
+      const label = getStringAttr(current.attrs, "label");
+      if (label) pieces.push(label);
     }
 
     if (current.type === BLOCK_MATH_NODE_TYPE || current.type === INLINE_MATH_NODE_TYPE) {
@@ -251,10 +364,17 @@ export const countMemoCharacters = (doc: unknown): number => {
       return;
     }
 
-    const current = node as { text?: unknown; content?: unknown };
+    const current = node as { type?: unknown; text?: unknown; attrs?: Record<string, unknown>; content?: unknown };
+
+    if (current.type === "codeBlock" && current.attrs?.language === FRONT_MATTER_LANGUAGE) return;
 
     if (typeof current.text === "string") {
       pieces.push(current.text);
+    }
+
+    if (current.type === PDF_ATTACHMENT_NODE_TYPE || current.type === FILE_ATTACHMENT_NODE_TYPE) {
+      const label = getStringAttr(current.attrs, "label");
+      if (label) pieces.push(label);
     }
 
     if (Array.isArray(current.content)) {
@@ -283,10 +403,15 @@ export const docToMarkdown = (doc: unknown): string => {
     return "";
   }
 
-  const serializableDoc = protectLiteralDollarPairs(stripEditorOnlyNodes(doc));
-  return markdownManager
+  const properties = getFrontMatterSource(doc as TiptapDoc);
+  const body = properties === null ? doc : { ...doc, content: root.content.slice(1) };
+  const serializableDoc = protectLiteralDollarPairs(prepareImageListsForMarkdown(projectNativeUnknownContentForMarkdown(
+    stripEditorOnlyNodes(body) as TiptapDoc
+  )));
+  const markdown = markdownManager
     .serialize(serializableDoc as Parameters<typeof markdownManager.serialize>[0])
     .replaceAll(LITERAL_DOLLAR_PLACEHOLDER, "\\$");
+  return properties === null ? markdown : `---\n${properties}\n---\n\n${markdown}`;
 };
 
 const LITERAL_DOLLAR_PLACEHOLDER = "\uE000edgeever-dollar\uE001";
@@ -297,7 +422,9 @@ const protectLiteralDollarPairs = (value: unknown): unknown => {
     return value;
   }
 
-  const node = value as { type?: unknown; text?: unknown; content?: unknown };
+  const node = value as { type?: unknown; text?: unknown; content?: unknown; marks?: Array<{ type?: string }> };
+  // Markdown does not interpret escapes inside code; adding them changes the source.
+  if (node.type === "codeBlock" || node.marks?.some((mark) => mark.type === "code")) return value;
   if (node.type === "text" && typeof node.text === "string") {
     const dollarCount = Array.from(node.text).filter((character) => character === "$").length;
     return dollarCount >= 2

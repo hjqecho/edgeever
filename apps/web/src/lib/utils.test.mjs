@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildNotebookTree } from "./utils.ts";
+import { buildNotebookTree, parseTagsText } from "./utils.ts";
 
 const notebook = (id, parentId, memoCount, lastMemoUpdatedAt = null) => ({
   id,
@@ -30,6 +30,18 @@ describe("buildNotebookTree", () => {
     expect(root.children[0].children[0].memoCount).toBe(5);
   });
 
+  test("keeps each notebook's own count next to the rolled-up total", () => {
+    const [root] = buildNotebookTree([
+      notebook("root", null, 2),
+      notebook("child", "root", 3),
+      notebook("grandchild", "child", 5),
+    ]);
+
+    expect([root.directMemoCount, root.memoCount]).toEqual([2, 10]);
+    expect([root.children[0].directMemoCount, root.children[0].memoCount]).toEqual([3, 8]);
+    expect([root.children[0].children[0].directMemoCount, root.children[0].children[0].memoCount]).toEqual([5, 5]);
+  });
+
   test("sorts siblings after descendant counts have been rolled up", () => {
     const roots = buildNotebookTree(
       [
@@ -52,5 +64,16 @@ describe("buildNotebookTree", () => {
 
     expect(root.memoCount).toBe(1);
     expect(root).not.toHaveProperty("children");
+  });
+});
+
+describe("tag text parsing", () => {
+  test("supports multi-word tags and normalizes separators", () => {
+    expect(parseTagsText(" #product design, work，ideas\nwork ")).toEqual([
+      "product design",
+      "work",
+      "ideas",
+      "work",
+    ]);
   });
 });

@@ -15,8 +15,11 @@ struct TipTapSession {
     var onChange: ((String, String) -> Void)?
     var onResourcePress: ((ResourceTarget) -> Void)?
     var onImagePreview: ((_ source: String, _ alt: String) -> Void)?
+    var onDoubleTap: (() -> Void)?
     var onPickImage: (() -> Void)?
     var onSearchResult: ((_ count: Int, _ index: Int) -> Void)?
+    var onReaderScroll: ((_ collapsed: Bool) -> Void)?
+    var onImageExportEvent: (([String: Any]) -> Void)?
     var onBodyReady: (() -> Void)?
 }
 
@@ -54,7 +57,7 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
     private var lastEditorEmittedFingerprint: String?
     private var lastAppliedConfiguration: String?
     private var hydrateGeneration: UInt64 = 0
-    private var bodyReadyGeneration: UInt64 = 0
+    private var bodyReadyGeneration: UInt64?
     private var contentGeneration: UInt64 = 0
     /// Only auto-focus caret once per content generation (open edit), never while typing.
     private var focusedGeneration: UInt64 = 0
@@ -130,6 +133,7 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
 
     func detach(from container: UIView) {
         guard hostContainer === container else { return }
+        bodyReadyGeneration = nil
         // Keep the engine alive off-screen; only leave the hierarchy.
         webView.removeFromSuperview()
         hostContainer = nil
@@ -142,13 +146,15 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
             needsForcePushOnBind = true
         }
         // Drop action callbacks for the dismantled SwiftUI host so late JS `change`
-        // events cannot rewrite the next create draft with this session's body.
+        // events cannot rewrite a later editor session with this session's body.
         if var s = session {
             s.onChange = nil
             s.onResourcePress = nil
             s.onImagePreview = nil
+            s.onDoubleTap = nil
             s.onPickImage = nil
             s.onSearchResult = nil
+            s.onReaderScroll = nil
             s.onBodyReady = nil
             session = s
         }
@@ -166,7 +172,7 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
         if fp != previousFingerprint || needsForcePushOnBind {
             contentGeneration &+= 1
             hydrateGeneration &+= 1
-            // Do not zero bodyReadyGeneration here — pushContent / skip path will notify.
+            bodyReadyGeneration = nil
         }
         let modeChanged = previousMode != nil && previousMode != newSession.mode
         let forcePush = modeChanged || needsForcePushOnBind
@@ -190,6 +196,11 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
     func focusEnd() {
         guard session?.mode == .editor else { return }
         focusEnd(attempt: 0)
+    }
+
+    func resetReaderScroll() {
+        guard ready, slot == .viewer else { return }
+        webView.evaluateJavaScript("window.EdgeEverEditor?.resetReaderScroll?.()", completionHandler: nil)
     }
 
     /// Select a match inside the current viewer/editor and return the total + active index.
@@ -382,17 +393,35 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
         return true
     }
 
+    /// Group only successfully inserted images from this picker batch.
+    func groupImages(sources: [String]) async -> Bool {
+        guard ready, session?.mode == .editor,
+              let json = try? JSONEncoder().encode(sources) else { return false }
+        let encoded = json.base64EncodedString()
+        let js = """
+        (function(){
+          const bytes = Uint8Array.from(atob('\(encoded)'), c => c.charCodeAt(0));
+          return window.EdgeEverEditor.groupImages(JSON.parse(new TextDecoder().decode(bytes)));
+        })();
+        """
+        return await withCheckedContinuation { continuation in
+            webView.evaluateJavaScript(js) { result, _ in
+                continuation.resume(returning: (result as? Bool) ?? false)
+            }
+        }
+    }
+
     /// Read current editor markdown + JSON after a mutation (avoids racing the async bridge onChange).
     func snapshotContent() async -> (markdown: String, json: String)? {
-        guard ready else { return nil }
+        guard ready, bodyReadyGeneration == contentGeneration else { return nil }
+        let gen = contentGeneration
         let js = """
         (function(){
           try {
             if (!window.EdgeEverEditor) return null;
-            var md = '';
-            var json = '';
-            try { md = window.EdgeEverEditor.getMarkdown() || ''; } catch (e) {}
-            try { json = window.EdgeEverEditor.getDocument() || ''; } catch (e) {}
+            var md = window.EdgeEverEditor.getMarkdown();
+            var json = window.EdgeEverEditor.getDocument();
+            if (typeof md !== 'string' || typeof json !== 'string') return null;
             return JSON.stringify({ md: md, json: json });
           } catch (e) { return null; }
         })();
@@ -402,7 +431,8 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
                 cont.resume(returning: value)
             }
         }
-        guard let text = raw as? String,
+        guard contentGeneration == gen, bodyReadyGeneration == gen,
+              let text = raw as? String,
               let data = text.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
@@ -410,6 +440,29 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
         let json = obj["json"] as? String ?? ""
         guard !json.isEmpty || !md.isEmpty else { return nil }
         return (md, json)
+    }
+
+    func exportNoteImage(request: [String: Any]) {
+        guard ready,
+              JSONSerialization.isValidJSONObject(request),
+              let data = try? JSONSerialization.data(withJSONObject: request),
+              let json = String(data: data, encoding: .utf8)
+        else { return }
+        let requestId = request["requestId"] as? String ?? ""
+        let requestIdLiteral = String(data: (try? JSONSerialization.data(withJSONObject: requestId, options: .fragmentsAllowed)) ?? Data("\"\"".utf8), encoding: .utf8) ?? "\"\""
+        let js = """
+        (function(){
+          try {
+            if (!window.EdgeEverEditor || !window.EdgeEverEditor.exportImage) return false;
+            window.EdgeEverEditor.exportImage(\(json));
+            return true;
+          } catch (e) {
+            try { window.webkit.messageHandlers.edgeever.postMessage({type:'imageExportError', requestId:\(requestIdLiteral), message:String(e)}); } catch (_) {}
+            return false;
+          }
+        })();
+        """
+        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     private func scheduleFocusEnd(for generation: UInt64) {
@@ -454,7 +507,9 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
     // MARK: - WKNavigationDelegate
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        ready = true
+        // Navigation completion does not acknowledge that the editor bridge exists.
+        // The bundle (including the fallback) posts `ready` after installing its API.
+        guard ready else { return }
         lastAppliedConfiguration = nil
         applyMode()
         pushContentIfNeeded(force: true)
@@ -465,7 +520,7 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
     private func applyMode() {
         guard ready, let session else { return }
         let mode = session.mode.rawValue
-        let locale = session.locale == "en-US" ? "en-US" : "zh-CN"
+        let locale = ["en-US", "ja", "pl"].contains(session.locale) ? session.locale : "zh-CN"
         let theme = session.theme == "dark" ? "dark" : "light"
         let configuration = "\(mode)|\(locale)|\(theme)|\(session.placeholder)"
         if lastAppliedConfiguration == configuration { return }
@@ -519,21 +574,22 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
         let fn = useJSON ? "setDocumentFromJSON" : "setMarkdown"
         let payload = decision.payload
         let js = TipTapResourceLoader.jsCall(fn: fn, arg: payload)
-        // Capture callback now — detach may nil session callbacks before the JS completion runs.
-        let bodyReadyCb = session.onBodyReady
-        webView.evaluateJavaScript(js) { [weak self] _, error in
+        bodyReadyGeneration = nil
+        lastPushedJSON = nil
+        lastEditorEmittedFingerprint = nil
+        webView.evaluateJavaScript(js) { [weak self] result, error in
             #if DEBUG
             if let error { NSLog("SharedTipTapRuntime pushContent error: \(error)") }
             #endif
-            guard let self else { return }
+            guard let self, error == nil, result as? Bool == true else { return }
             Task { @MainActor in
                 // Only stamp fingerprints after a successful push for this generation.
                 // Stamping before JS completed caused empty-create to skip a later force
                 // while the WebView still held the previous note body.
-                guard self.contentGeneration == gen else { return }
+                guard self.contentGeneration == gen, self.hostContainer != nil else { return }
                 self.lastPushedJSON = fingerprint
                 self.lastEditorEmittedFingerprint = fingerprint
-                self.notifyBodyReady(generation: gen, callback: bodyReadyCb)
+                self.notifyBodyReady(generation: gen)
                 if shouldFocusAfterPush {
                     self.scheduleFocusEnd(for: gen)
                 }
@@ -542,12 +598,15 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
         }
     }
 
-    private func notifyBodyReady(generation: UInt64, callback: (() -> Void)? = nil) {
-        let cb = callback ?? session?.onBodyReady
+    private func notifyBodyReady(generation: UInt64) {
         // Always invoke the *current* host callback when re-binding the same content,
         // even if we already marked this generation ready (new SwiftUI view needs it).
         bodyReadyGeneration = generation
-        DispatchQueue.main.async { cb?() }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.bodyReadyGeneration == generation,
+                  self.contentGeneration == generation else { return }
+            self.session?.onBodyReady?()
+        }
     }
 
     // MARK: - Image hydrate
@@ -635,8 +694,9 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
             pushContentIfNeeded(force: true)
         case "change":
             // Host dismantled (create/edit dismissed) — drop late events so they cannot
-            // resurrect the previous body into a new-note draft via onChange autosave.
-            guard let session, session.onChange != nil else { return }
+            // resurrect the previous body in a later editor session.
+            guard bodyReadyGeneration == contentGeneration,
+                  let session, session.onChange != nil else { return }
             let md = body["contentMarkdown"] as? String ?? ""
             let json = body["contentJson"] as? String ?? session.documentJSON
             let emptyStub = "{\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\"}]}"
@@ -663,6 +723,9 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
             guard !source.isEmpty else { break }
             let cb = session?.onImagePreview
             DispatchQueue.main.async { cb?(source, alt) }
+        case "doubleTap":
+            let cb = session?.onDoubleTap
+            DispatchQueue.main.async { cb?() }
         case "pickImage":
             let cb = session?.onPickImage
             DispatchQueue.main.async { cb?() }
@@ -671,6 +734,13 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
             let index = (body["index"] as? NSNumber)?.intValue ?? 0
             let cb = session?.onSearchResult
             DispatchQueue.main.async { cb?(count, index) }
+        case "readerScroll":
+            guard slot == .viewer, let collapsed = (body["collapsed"] as? NSNumber)?.boolValue else { break }
+            let cb = session?.onReaderScroll
+            DispatchQueue.main.async { cb?(collapsed) }
+        case "imageExportChunk", "imageExportComplete", "imageExportError", "imageExportFontStatus", "imageExportFontsReady":
+            let cb = session?.onImageExportEvent
+            DispatchQueue.main.async { cb?(body) }
         default:
             break
         }

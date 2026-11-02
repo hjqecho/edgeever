@@ -1,18 +1,21 @@
 import { cn } from "@/lib/utils";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
 import * as React from "react";
 
+const ButtonTooltip = React.lazy(() =>
+  import("./button-tooltip").then((module) => ({ default: module.ButtonTooltip }))
+);
+
 const buttonVariants = cva(
-  "inline-flex shrink-0 items-center justify-center rounded-md font-medium transition-[color,background-color,border-color,box-shadow,transform] duration-150 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/70 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50",
+  "inline-flex shrink-0 items-center justify-center rounded-md font-medium transition-[color,background-color,border-color,box-shadow,transform] duration-150 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-900/20 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50",
   {
     variants: {
       variant: {
         solid: "bg-emerald-500 text-white hover:bg-emerald-600 border-emerald-500",
-        soft: "bg-slate-50 text-slate-700 hover:bg-slate-100 border-slate-200",
+        soft: "bg-slate-50 text-slate-700 hover:bg-slate-100 border border-slate-200",
         ghost: "bg-transparent text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent",
-        outline: "bg-white text-slate-700 hover:bg-slate-50 border border-slate-200",
+        outline: "bg-card text-slate-700 hover:bg-slate-50 border border-slate-200",
         danger: "bg-rose-50 text-rose-700 hover:bg-rose-100 border border-rose-100",
       },
       size: {
@@ -20,6 +23,8 @@ const buttonVariants = cva(
         sm: "h-8 gap-1.5 px-2.5 text-xs",
         md: "h-9 gap-2 px-3 text-sm",
         icon: "h-8 w-8 p-0",
+        "icon-sm": "size-7 p-0",
+        "icon-xs": "size-6 p-0",
       },
     },
     defaultVariants: {
@@ -51,12 +56,9 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
     }
 
     return (
-      <TooltipProvider delayDuration={0} skipDelayDuration={0}>
-        <Tooltip>
-          <TooltipTrigger asChild>{button}</TooltipTrigger>
-          <TooltipContent side="bottom">{title}</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+      <React.Suspense fallback={button}>
+        <ButtonTooltip title={title}>{button}</ButtonTooltip>
+      </React.Suspense>
     );
   }
 );

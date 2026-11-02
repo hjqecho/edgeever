@@ -1,13 +1,18 @@
 import { z } from "zod";
 import type { TiptapDoc } from "./content";
-import type { MemoDetail, Notebook, Resource } from "./types";
+import {
+  AI_ACTIONS,
+  AI_PROMPT_PARAMETER_KINDS,
+  AI_PROMPT_RESULT_MODES,
+} from "./ai-assistant";
+import type { AiPromptTemplate, MemoDetail, Notebook, Resource } from "./types";
 
 export const EDGEEVER_ZIP_FORMAT = "edgeever-zip";
-export const EDGEEVER_ZIP_FORMAT_VERSION = 1;
+export const EDGEEVER_ZIP_FORMAT_VERSION = 2;
 
 export type JsonBackupManifest = {
   format: typeof EDGEEVER_ZIP_FORMAT;
-  formatVersion: typeof EDGEEVER_ZIP_FORMAT_VERSION;
+  formatVersion: 1 | typeof EDGEEVER_ZIP_FORMAT_VERSION;
   schemaVersion: number;
   edgeeverVersion: string;
   buildId: string;
@@ -18,6 +23,7 @@ export type JsonBackupManifest = {
     memos: number;
     revisions: number;
     resources: number;
+    prompts?: number;
   };
 };
 
@@ -47,11 +53,13 @@ export type JsonBackupMemo = {
   resources: JsonBackupResource[];
 };
 
+export type JsonBackupAiPrompt = AiPromptTemplate;
+
 const DateTimeSchema = z.string().datetime();
 
 export const JsonBackupManifestSchema = z.object({
   format: z.literal(EDGEEVER_ZIP_FORMAT),
-  formatVersion: z.literal(EDGEEVER_ZIP_FORMAT_VERSION),
+  formatVersion: z.union([z.literal(1), z.literal(EDGEEVER_ZIP_FORMAT_VERSION)]),
   schemaVersion: z.number().int().positive(),
   edgeeverVersion: z.string().trim().min(1),
   buildId: z.string().trim().min(1),
@@ -62,6 +70,7 @@ export const JsonBackupManifestSchema = z.object({
     memos: z.number().int().min(0),
     revisions: z.number().int().min(0),
     resources: z.number().int().min(0),
+    prompts: z.number().int().min(0).optional(),
   }),
 });
 
@@ -72,6 +81,11 @@ export const JsonBackupNotebookSchema = z.object({
   slug: z.string().nullable(),
   icon: z.string().nullable(),
   color: z.string().nullable(),
+  textColor: z.string().nullable().optional(),
+  colorTarget: z.enum(["icon", "name", "both"]).optional(),
+  isBold: z.boolean().optional(),
+  iconInverted: z.boolean().optional(),
+  rowInverted: z.boolean().optional(),
   sortOrder: z.number().int(),
   createdAt: DateTimeSchema,
   updatedAt: DateTimeSchema,
@@ -141,4 +155,95 @@ export const RestoreJsonMemosSchema = z.object({
   memos: z.array(JsonBackupMemoSchema).min(1).max(10),
 });
 
+export const JsonBackupAiPromptSchema = z.object({
+  id: z.string().trim().min(1).max(200),
+  origin: z.enum(["default", "custom"]),
+  seedKey: z.enum(AI_ACTIONS.filter((action) => action !== "custom") as [
+    Exclude<(typeof AI_ACTIONS)[number], "custom">,
+    ...Exclude<(typeof AI_ACTIONS)[number], "custom">[],
+  ]).nullable(),
+  action: z.enum(AI_ACTIONS),
+  parameterKind: z.enum(AI_PROMPT_PARAMETER_KINDS),
+  resultMode: z.enum(AI_PROMPT_RESULT_MODES),
+  nameCustomized: z.boolean(),
+  descriptionCustomized: z.boolean(),
+  instructionCustomized: z.boolean(),
+  name: z.string().trim().min(1).max(80),
+  description: z.string().max(200).nullable(),
+  instruction: z.string().trim().min(1).max(2_000),
+  createdAt: DateTimeSchema,
+  updatedAt: DateTimeSchema,
+}).superRefine((prompt, context) => {
+  if (prompt.origin === "default" && !prompt.seedKey) {
+    context.addIssue({
+      code: "custom",
+      path: ["seedKey"],
+      message: "A default prompt must include a seed key.",
+    });
+  }
+  if (prompt.origin === "default" && prompt.seedKey && prompt.action !== prompt.seedKey) {
+    context.addIssue({
+      code: "custom",
+      path: ["action"],
+      message: "A default prompt action must match its seed key.",
+    });
+  }
+  if (prompt.origin === "custom" && (prompt.seedKey !== null || prompt.action !== "custom")) {
+    context.addIssue({
+      code: "custom",
+      path: ["origin"],
+      message: "A custom prompt cannot use factory prompt identity.",
+    });
+  }
+});
+
+export const RestoreJsonAiPromptsSchema = z.object({
+  prompts: z.array(JsonBackupAiPromptSchema).max(100),
+});
+
 export const JsonBackupResourceMetadataSchema = JsonBackupMemoSchema.shape.resources.element;
+
+// Desktop-only IPC metadata. Archive bytes and saved passwords never cross this interface.
+export type DesktopBackupConfig = {
+  enabled: boolean;
+  interval: "daily" | "weekly" | "biweekly" | "monthly";
+  retention: 1 | 3 | 5 | 10 | 20;
+  directory: string;
+  encrypted: boolean;
+};
+export type DesktopBackupError = { code: string; message?: string; status?: number };
+export type DesktopBackupStatus = {
+  blocked: boolean;
+  config: DesktopBackupConfig;
+  backupSetId: string;
+  actualDirectory: string;
+  passwordSet: boolean;
+  secureStorageAvailable: boolean;
+  lastCheck: { at: string; result: "running" | "success" | "unchanged" | "failed" | "cancelled" } | null;
+  lastAttemptAt: string | null;
+  lastSuccessAt: string | null;
+  lastRestoreAt: string | null;
+  nextDueAt: string | null;
+  pendingPublication: { name: string; encrypted: boolean } | null;
+  target: { baseUrl: string; accountId: string };
+  error: DesktopBackupError | null;
+  warning: DesktopBackupError | null;
+  importError: DesktopBackupError | null;
+  importWarning: DesktopBackupError | null;
+  history: Array<{ name: string; directory: string; completedAt: string; size: number; encrypted: boolean }>;
+  task: null | { kind: "export" | "import"; phase: "checking-source" | "exporting" | "decrypting" | "checking" | "ready" | "restoring"; completed: number; total: number; manifest?: JsonBackupManifest };
+};
+export type DesktopBackupSelection = { id: string; name: string; encrypted: boolean };
+export type DesktopBackupActions = {
+  status: { input?: never; output: DesktopBackupStatus | null };
+  save: { input: { backupSetId: string; config: DesktopBackupConfig; password?: string }; output: DesktopBackupStatus };
+  "choose-directory": { input: { backupSetId: string }; output: string | null };
+  run: { input: { backupSetId: string; password?: string; options?: { name: string; encrypted: boolean } }; output: DesktopBackupStatus };
+  cancel: { input: { backupSetId: string }; output: DesktopBackupStatus | null };
+  "open-folder": { input: { backupSetId: string }; output: boolean };
+  "choose-import": { input: { backupSetId: string }; output: DesktopBackupSelection | null };
+  "select-history": { input: { backupSetId: string; name: string }; output: DesktopBackupSelection };
+  "delete-history": { input: { backupSetId: string; name: string }; output: DesktopBackupStatus };
+  "prepare-import": { input: { backupSetId: string; id: string; password?: string }; output: DesktopBackupStatus };
+  "confirm-import": { input: { backupSetId: string }; output: DesktopBackupStatus };
+};

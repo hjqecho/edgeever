@@ -3,11 +3,11 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { useTheme } from "./ThemeProvider";
+import { useAppearanceTheme } from "./ThemeProvider";
 
 export const ThemeToggle = ({ className, showLabel = false }: { className?: string; showLabel?: boolean }) => {
   const { t } = useTranslation();
-  const { resolvedTheme, setPreference } = useTheme();
+  const { resolvedTheme, setPreference } = useAppearanceTheme();
   const nextTheme = resolvedTheme === "dark" ? "light" : "dark";
   const label = nextTheme === "dark" ? t("settings.themeToggleToDark") : t("settings.themeToggleToLight");
 
@@ -26,7 +26,7 @@ export const ThemeToggle = ({ className, showLabel = false }: { className?: stri
             aria-label={label}
             onClick={() => setPreference(nextTheme)}
           >
-            {resolvedTheme === "dark" ? <SunMedium className="h-5 w-5" strokeWidth={2.25} /> : <MoonStar className="h-5 w-5" strokeWidth={2.25} />}
+            {resolvedTheme === "dark" ? <SunMedium className="h-4 w-4" strokeWidth={1.75} /> : <MoonStar className="h-4 w-4" strokeWidth={1.75} />}
             {showLabel && <span className="inline text-xs font-medium lg:hidden">{label}</span>}
           </Button>
         </TooltipTrigger>

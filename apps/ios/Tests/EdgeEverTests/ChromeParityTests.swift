@@ -100,6 +100,11 @@ final class ChromeParityTests: XCTestCase {
         XCTAssertTrue(src.contains("CreateMemoChrome.metaRow"), "missing meta row")
         XCTAssertTrue(src.contains("CreateMemoChrome.notebook"), "missing notebook control")
         XCTAssertTrue(src.contains("CreateMemoChrome.tags"), "missing tags field")
+        XCTAssertTrue(src.contains("CreateMemoChrome.smartTags"), "missing one-tap smart tags control")
+        XCTAssertTrue(src.contains("generateAndApplySmartTags"), "smart tags must generate and apply in one action")
+        XCTAssertTrue(src.contains("tag.badge.plus"), "smart tags must use the same tag-plus metaphor as web and Android")
+        XCTAssertFalse(src.contains("Image(systemName: \"tag\")"), "tags field must not repeat the tag icon beside the smart-tags control")
+        XCTAssertFalse(src.contains("AI 推荐标签"), "tag picker must not retain the multi-step AI suggestion flow")
         XCTAssertTrue(src.contains("CreateMemoChrome.editorFrame"), "missing bordered editor")
         XCTAssertTrue(src.contains("TipTapWebView"), "editor wiring must remain")
         XCTAssertTrue(src.contains("commitCreate") || src.contains("persistDraftOrQueue"), "save path must remain")
@@ -119,6 +124,23 @@ final class ChromeParityTests: XCTestCase {
         XCTAssertFalse(src.contains("ToolbarItem(placement: .cancellationAction)"), "system Close toolbar not Android create chrome")
     }
 
+    func testRegularCreateNeverRestoresOrPersistsPreviousCreateContent() throws {
+        let src = try readShippedSource("Features/Workspace/MemoEditView.swift")
+
+        XCTAssertFalse(
+            src.contains("env.drafts.read(scope: scope, key: DraftRepository.newKey)"),
+            "regular create must not restore the previous new-note draft"
+        )
+        XCTAssertFalse(
+            src.contains("makeDraft(key: DraftRepository.newKey"),
+            "regular create must not persist content for a later create session"
+        )
+        XCTAssertTrue(
+            src.contains("env.drafts.clear(scope: scope, key: DraftRepository.newKey)"),
+            "regular create must remove legacy new-note drafts"
+        )
+    }
+
     func testMemoDetailViewUsesDetailChromeAndEditFab() throws {
         let src = try readShippedSource("Features/Workspace/MemoDetailView.swift")
         XCTAssertTrue(src.contains("DetailMemoChrome.header") || src.contains("detailHeader"), src)
@@ -127,6 +149,9 @@ final class ChromeParityTests: XCTestCase {
         XCTAssertTrue(src.contains("DetailMemoChrome.history"), "missing history action")
         XCTAssertTrue(src.contains("DetailMemoChrome.metaRow"), "missing meta row")
         XCTAssertTrue(src.contains("DetailMemoChrome.title"), "missing detail title")
+        XCTAssertTrue(src.contains("showNotebookPicker"), "view-mode notebook affiliation must be tappable")
+        XCTAssertTrue(src.contains("moveMemoToNotebook"), "view-mode notebook change must persist without entering edit")
+        XCTAssertTrue(src.contains("EditNotebookPickerSheet"), "view-mode notebook picker must reuse the editor sheet")
         XCTAssertTrue(src.contains("TipTapWebView"), "viewer wiring must remain")
         // Edit is requested via callback; presentation is owned by WorkspaceView (reliable).
         XCTAssertTrue(src.contains("onEdit"), "detail requests edit via onEdit callback")
@@ -177,12 +202,14 @@ final class ChromeParityTests: XCTestCase {
 
     func testWorkspacePresentsCreateAsFullScreenCover() throws {
         let src = try readShippedSource("Features/Workspace/WorkspaceView.swift")
-        XCTAssertTrue(src.contains("fullScreenCover(isPresented: $showNewNote)"), src)
+        // The create cover may also pass onDismiss: to settle the create presentation.
+        XCTAssertTrue(src.contains("fullScreenCover(isPresented: $showNewNote"), "create presented at workspace root")
         XCTAssertTrue(
             src.contains("mode: .create(") || src.contains("MemoEditView(mode: .create"),
             "create wiring"
         )
-        XCTAssertTrue(src.contains("fullScreenCover(isPresented: $showSettings)"), "Me full screen")
+        XCTAssertTrue(src.contains("SettingsView(onClose: { showSettings = false })"), "Me uses workspace chrome")
+        XCTAssertTrue(src.contains("active: showSettings"), "Me selects the persistent bottom tab")
     }
 
     /// Bottom chrome must be one bar: nav height + home-indicator padding (Android parity).

@@ -20,8 +20,9 @@ settings:
     TARGETED_DEVICE_FAMILY: "1"
     SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: false
     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
-    CURRENT_PROJECT_VERSION: 33
-    MARKETING_VERSION: 1.12.6
+    # MARKETING_VERSION and CURRENT_PROJECT_VERSION live only in
+    # Config/Version.xcconfig. Hardcoding them here makes xcodegen overwrite
+    # the Release tag during ci_post_clone.
     # Automatic signing: required for Xcode Cloud (managed certs/profiles for
     # App Store + Development exports). Local ExportOptions.plist still pins
     # App Store profiles for Scripts/archive-app-store.sh export.
@@ -41,11 +42,17 @@ targets:
       - path: EdgeEver
         excludes:
           - Resources/Info.plist
+          - Resources/EditorBundle/assets
+      - path: EdgeEver/Resources/EditorBundle/assets
+        type: folder
+        buildPhase: resources
     resources:
       - path: EdgeEver/Resources/Assets.xcassets
       - path: EdgeEver/Resources/Localizable.xcstrings
       - path: EdgeEver/Resources/PrivacyInfo.xcprivacy
       - path: EdgeEver/Resources/EditorBundle
+        excludes:
+          - assets
     dependencies:
       - package: GRDB
         product: GRDB
@@ -79,6 +86,11 @@ targets:
         CFBundleName: EdgeEver
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleLocalizations:
+          - en
+          - zh-Hans
+          - ja
+          - pl
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

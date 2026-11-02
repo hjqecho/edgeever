@@ -4,6 +4,80 @@ import XCTest
 
 /// Exercises shipped parity helpers (same semantics as Android `@edgeever/shared/mobile-ui` + notebooks).
 final class MobileUIParityTests: XCTestCase {
+    @MainActor
+    func testImageShareChoicesPersistAcrossStoreRecreation() throws {
+        let suite = "image-share-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let first = PreferencesStore(defaults: defaults)
+        first.noteImageShare.theme = "book"
+        first.noteImageShare.fontStyle = "serif"
+        first.noteImageShare.fontSize = "md"
+        first.noteImageShare.cardWidth = "compact"
+        first.noteImageShare.format = "jpeg"
+        first.noteImageShare.showTitle = false
+        first.noteImageShare.showNotebook = true
+        first.noteImageShare.showTags = true
+        first.noteImageShare.showUpdatedAt = false
+        first.noteImageShare.showBranding = false
+        let reopened = PreferencesStore(defaults: try XCTUnwrap(UserDefaults(suiteName: suite)))
+        XCTAssertEqual(reopened.noteImageShare, first.noteImageShare)
+        // False and true choices both persist when changed back.
+        reopened.noteImageShare = NoteImageSharePreferences()
+        XCTAssertEqual(PreferencesStore(defaults: defaults).noteImageShare, NoteImageSharePreferences())
+    }
+
+    func testImageShareOldDefaultBecomesGlass() throws {
+        let raw = #"{"theme":"gradient","fontStyle":"serif","showTitle":false}"#
+        let settings = try JSONDecoder().decode(NoteImageSharePreferences.self, from: Data(raw.utf8))
+        XCTAssertEqual(settings.theme, "glass")
+        XCTAssertEqual(settings.fontStyle, "serif")
+        XCTAssertFalse(settings.showTitle)
+    }
+
+    func testImageShareInvalidFieldsDoNotDiscardValidChoices() throws {
+        let raw = #"{"theme":"removed","fontStyle":"serif","fontSize":12,"cardWidth":"compact","format":"svg","showTitle":false,"showNotebook":true,"showTags":"true","showUpdatedAt":false,"showBranding":false}"#
+        let settings = try JSONDecoder().decode(NoteImageSharePreferences.self, from: Data(raw.utf8))
+        XCTAssertEqual(settings.theme, "glass")
+        XCTAssertEqual(settings.fontStyle, "serif")
+        XCTAssertEqual(settings.fontSize, "lg")
+        XCTAssertEqual(settings.cardWidth, "compact")
+        XCTAssertEqual(settings.format, "png")
+        XCTAssertFalse(settings.showTitle)
+        XCTAssertTrue(settings.showNotebook)
+        XCTAssertFalse(settings.showTags)
+        XCTAssertFalse(settings.showUpdatedAt)
+        XCTAssertFalse(settings.showBranding)
+    }
+
+    @MainActor
+    func testImageShareCorruptStorageFallsBackWithoutRewritingOnLoad() throws {
+        let suite = "image-share-corrupt-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let raw = Data("{broken".utf8)
+        defaults.set(raw, forKey: "edgeever.ios.noteImagePreferences")
+        XCTAssertEqual(PreferencesStore(defaults: defaults).noteImageShare, NoteImageSharePreferences())
+        XCTAssertEqual(defaults.data(forKey: "edgeever.ios.noteImagePreferences"), raw)
+    }
+
+    func testUnmatchedSystemLanguageUsesEnglishUI() {
+        // Japanese is a first-class UI language, so a Japanese system no longer falls back to English.
+        XCTAssertFalse(AppUILocale.usesEnglish(preferenceCode: "system", systemLanguageCode: "ja"))
+        XCTAssertEqual(AppUILocale.language(preferenceCode: "system", systemLanguageCode: "ja"), .japanese)
+        // Polish is a first-class UI language as well.
+        XCTAssertFalse(AppUILocale.usesEnglish(preferenceCode: "system", systemLanguageCode: "pl"))
+        XCTAssertEqual(AppUILocale.language(preferenceCode: "system", systemLanguageCode: "pl"), .polish)
+        XCTAssertEqual(AppUILocale.language(preferenceCode: "pl", systemLanguageCode: "zh"), .polish)
+        XCTAssertEqual(AppUILocale.language(preferenceCode: "system", systemLanguageCode: "PL"), .polish)
+        XCTAssertTrue(AppUILocale.usesEnglish(preferenceCode: "system", systemLanguageCode: "fr"))
+        XCTAssertTrue(AppUILocale.usesEnglish(preferenceCode: "system", systemLanguageCode: "en"))
+        XCTAssertTrue(AppUILocale.usesEnglish(preferenceCode: "system", systemLanguageCode: nil))
+        XCTAssertFalse(AppUILocale.usesEnglish(preferenceCode: "system", systemLanguageCode: "zh"))
+        XCTAssertFalse(AppUILocale.usesEnglish(preferenceCode: "zh-CN", systemLanguageCode: "ja"))
+        XCTAssertTrue(AppUILocale.usesEnglish(preferenceCode: "en-US", systemLanguageCode: "zh"))
+    }
+
     func testToggleFilterReturnsToAllWhenPressedAgain() {
         XCTAssertEqual(
             MobileUI.toggleMemoFilterMode(current: .all, requested: .pinned),
@@ -19,6 +93,24 @@ final class MobileUIParityTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testSelectingTagResetsConflictingListState() {
+        let store = WorkspaceStore()
+        store.selectedNotebookId = "notebook"
+        store.searchText = "query"
+        store.filter = .pinned
+        store.enterSelection(memoId: "memo")
+
+        store.selectTag("Work")
+
+        XCTAssertEqual(store.selectedTag, "Work")
+        XCTAssertNil(store.selectedNotebookId)
+        XCTAssertEqual(store.searchText, "")
+        XCTAssertEqual(store.filter, .all)
+        XCTAssertFalse(store.selectionMode)
+        XCTAssertTrue(store.selectedMemoIds.isEmpty)
+    }
+
     func testToggleSelectionAddAndRemove() {
         let once = MobileUI.toggleMemoSelection(current: [], memoId: "a")
         XCTAssertEqual(once, ["a"])
@@ -26,6 +118,57 @@ final class MobileUIParityTests: XCTestCase {
         XCTAssertTrue(twice.isEmpty)
         let multi = MobileUI.toggleMemoSelection(current: once, memoId: "b")
         XCTAssertEqual(multi, ["a", "b"])
+    }
+
+    func testSingleTagSelectionReplacesThePreviousTag() {
+        XCTAssertEqual(
+            MobileUI.toggleTagSelection(current: ["old"], tag: "new", maxSelections: 1),
+            ["new"]
+        )
+        XCTAssertEqual(
+            MobileUI.toggleTagSelection(current: ["new"], tag: "new", maxSelections: 1),
+            []
+        )
+    }
+
+    func testExactTagMatchIgnoresCaseAndOverlappingNames() {
+        XCTAssertTrue(MobileUI.memoHasExactTag(tags: ["Project Alpha", "Work"], tag: "project alpha"))
+        XCTAssertTrue(MobileUI.memoHasExactTag(tags: ["Project Alpha", "Work"], tag: " project alpha "))
+        XCTAssertFalse(MobileUI.memoHasExactTag(tags: ["Project Alpha", "Work"], tag: "project"))
+        XCTAssertFalse(MobileUI.memoHasExactTag(tags: ["Homework"], tag: "work"))
+        XCTAssertFalse(MobileUI.memoHasExactTag(tags: ["demo-extra"], tag: "demo"))
+    }
+
+    func testMemoListTimestampMatchesSortMode() {
+        let memo = MemoSummary(
+            id: "memo",
+            notebookId: "notebook",
+            title: "Imported",
+            excerpt: "",
+            tags: [],
+            isPinned: false,
+            isArchived: false,
+            isDeleted: false,
+            revision: 0,
+            createdAt: "2010-08-30T02:00:00.000Z",
+            updatedAt: "2026-08-25T01:59:00.000Z",
+            deletedAt: nil
+        )
+
+        XCTAssertEqual(MemoListTimestampField.resolve(for: .createdDesc).value(from: memo), memo.createdAt)
+        XCTAssertEqual(MemoListTimestampField.resolve(for: .updatedDesc).value(from: memo), memo.updatedAt)
+        XCTAssertEqual(MemoListTimestampField.resolve(for: .titleAsc).value(from: memo), memo.updatedAt)
+        XCTAssertEqual(MemoListTimestampField.resolve(for: .titleDesc).value(from: memo), memo.updatedAt)
+    }
+
+    func testMemoDetailDateIncludesHistoricalYear() {
+        let value = MemoDetailDate.format(
+            "2010-08-30T12:34:00.000Z",
+            locale: Locale(identifier: "en_US"),
+            timeZone: TimeZone(secondsFromGMT: 0)!
+        )
+        XCTAssertTrue(value.contains("2010"))
+        XCTAssertEqual(MemoDetailDate.format("not-a-date"), "")
     }
 
     func testNotebookDescendantsMatchTree() {
@@ -37,6 +180,33 @@ final class MobileUIParityTests: XCTestCase {
         ]
         let ids = NotebookHierarchy.descendantIds(notebooks: notebooks, targetNotebookId: "root")
         XCTAssertEqual(Set(ids), Set(["root", "child", "grand"]))
+    }
+
+    func testNotebookScopeFollowsDescendantPreference() {
+        let notebooks = [
+            makeNotebook(id: "root", parent: nil, name: "Root", order: 0),
+            makeNotebook(id: "child", parent: "root", name: "Child", order: 0),
+            makeNotebook(id: "grand", parent: "child", name: "Grand", order: 0),
+        ]
+        XCTAssertEqual(
+            Set(NotebookHierarchy.scopeIds(notebooks: notebooks, targetNotebookId: "root", includeDescendants: true)),
+            Set(["root", "child", "grand"])
+        )
+        XCTAssertEqual(
+            NotebookHierarchy.scopeIds(notebooks: notebooks, targetNotebookId: "root", includeDescendants: false),
+            ["root"]
+        )
+    }
+
+    func testNotebookDescendantMemoCountExcludesTheNotebookItself() {
+        let notebooks = [
+            makeNotebook(id: "root", parent: nil, name: "Root", order: 0, memoCount: 2),
+            makeNotebook(id: "child", parent: "root", name: "Child", order: 0, memoCount: 3),
+            makeNotebook(id: "grand", parent: "child", name: "Grand", order: 0, memoCount: 1),
+            makeNotebook(id: "other", parent: nil, name: "Other", order: 1, memoCount: 9),
+        ]
+        XCTAssertEqual(NotebookHierarchy.descendantMemoCount(notebooks: notebooks, targetNotebookId: "root"), 4)
+        XCTAssertEqual(NotebookHierarchy.descendantMemoCount(notebooks: notebooks, targetNotebookId: "grand"), 0)
     }
 
     func testFilterCollapsedHidesDescendants() {
@@ -263,7 +433,9 @@ final class MobileUIParityTests: XCTestCase {
             nav.onFinish = { exp.fulfill() }
             webView.loadHTMLString(html, baseURL: URL(string: "https://edgeever.local/"))
         }
-        await fulfillment(of: [exp], timeout: 5)
+        // The first WKWebView in the test process cold-starts WebKit's helper processes,
+        // which takes well over 5s on CI simulators.
+        await fulfillment(of: [exp], timeout: 30)
         // Poll naturalWidth via JS (give the scheme handler a moment if needed).
         var width = 0
         for _ in 0 ..< 20 {
@@ -311,7 +483,7 @@ final class MobileUIParityTests: XCTestCase {
         XCTAssertEqual(tagged.memos.map(\.id), ["p2"])
     }
 
-    private func makeNotebook(id: String, parent: String?, name: String, order: Int) -> Notebook {
+    private func makeNotebook(id: String, parent: String?, name: String, order: Int, memoCount: Int = 0) -> Notebook {
         Notebook(
             id: id,
             parentId: parent,
@@ -320,7 +492,7 @@ final class MobileUIParityTests: XCTestCase {
             icon: nil,
             color: nil,
             sortOrder: order,
-            memoCount: 0,
+            memoCount: memoCount,
             lastMemoUpdatedAt: nil,
             createdAt: EdgeEverDate.nowString(),
             updatedAt: EdgeEverDate.nowString()

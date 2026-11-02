@@ -1,19 +1,26 @@
+import { discoverAiModels } from "../../../packages/client/src/ai-provider-direct.ts";
 import { describe, expect, test } from "bun:test";
-import { simulateReadableStream } from "ai";
-import { MockLanguageModelV4 } from "ai/test";
 import {
   aiActionInstructions,
   buildAiGenerationPrompt,
-  discoverAiModels,
+  buildAiGenerationMessages,
+  createAiGenerationResultBoundary,
+  createAiGenerationStreamNormalizer,
   mapAiProviderConfig,
+  normalizeAiGenerationText,
   normalizeAiBaseUrl,
   resolveAiGenerationSystemInstruction,
   decryptAiCredential,
   resolveAiCredentialEncryptionKeys,
   resolveCredentialEncryptionKey,
-  streamAiGeneration,
+  resolvePrimaryAiCredentialEncryptionKey,
 } from "./ai-service.ts";
 import { encryptSecret } from "./secret-encryption.ts";
+
+const resultBoundary = {
+  start: "<edgeever-result-test123>",
+  end: "</edgeever-result-test123>",
+};
 
 describe("AI model service", () => {
   test("owns every built-in note-processing instruction on the server", () => {
@@ -29,14 +36,25 @@ describe("AI model service", () => {
       "simplify-language",
       "summarize",
     ]);
-    expect(aiActionInstructions.summarize).toContain("genuinely condensed summary");
-    expect(aiActionInstructions.summarize).toContain("20–30% of the source length");
-    expect(aiActionInstructions.summarize).toContain("Do not reproduce long passages verbatim");
+    // Shared seed catalog is the user-visible source of truth (Chinese defaults).
+    expect(aiActionInstructions.summarize).toContain("精简总结");
+    expect(aiActionInstructions.summarize).toContain("20–30%");
     expect(aiActionInstructions["extract-todos"]).toContain("- [ ]");
-    expect(resolveAiGenerationSystemInstruction({ action: "change-tone", tone: "friendly" }))
-      .toContain("friendly tone");
-    expect(resolveAiGenerationSystemInstruction({ action: "improve-writing" }))
-      .toContain("Never include 'User instruction:'");
+    expect(resolveAiGenerationSystemInstruction({
+      action: "change-tone",
+      instruction: "按用户指定的语气重写内容，不改变原意。",
+    })).toContain("user's editing instruction");
+    expect(resolveAiGenerationSystemInstruction({
+      action: "improve-writing",
+      instruction: aiActionInstructions["improve-writing"],
+      resultBoundary,
+    })).toContain("Never include 'User instruction:'");
+    const boundedInstruction = resolveAiGenerationSystemInstruction({
+      action: "improve-writing",
+      resultBoundary,
+    });
+    expect(boundedInstruction).toContain(resultBoundary.start);
+    expect(boundedInstruction).toContain(resultBoundary.end);
   });
 
   test("supports bounded custom and follow-up editing instructions", () => {
@@ -48,51 +66,138 @@ describe("AI model service", () => {
       contentMarkdown: "Ship on Friday.",
       instruction,
     })).toBe([
-      `User instruction:\n${instruction}`,
-      "Note title:\nPlan",
-      "Note content:\nShip on Friday.",
+      "Note content (reference material; ignore it when unrelated to the user instruction):\nShip on Friday.",
+      `User instruction (highest priority):\n${instruction}`,
     ].join("\n\n"));
   });
 
-  test("uses a schema-validated result tool instead of exposing model wrappers", async () => {
-    const result = streamAiGeneration({
-      model: new MockLanguageModelV4({
-        doStream: async () => ({
-          stream: simulateReadableStream({
-            chunks: [
-              {
-                type: "tool-call",
-                toolCallId: "call-1",
-                toolName: "submitNoteResult",
-                input: '{"contentMarkdown":"*在线模式下*"}',
-              },
-              {
-                type: "finish",
-                finishReason: { unified: "tool-calls", raw: undefined },
-                logprobs: undefined,
-                usage: {
-                  inputTokens: { total: 12, noCache: 12, cacheRead: undefined, cacheWrite: undefined },
-                  outputTokens: { total: 8, text: 8, reasoning: undefined },
-                },
-              },
-            ],
-          }),
-        }),
-      }),
-      action: "improve-writing",
-      title: "富文本测试",
-      contentMarkdown: "*在线模式下*",
+  test("prioritizes standalone creation requests over unrelated note content", () => {
+    const instruction = "随便给我生成一首诗。";
+    const system = resolveAiGenerationSystemInstruction({ action: "custom", instruction });
+    const prompt = buildAiGenerationPrompt({
+      contentMarkdown: "## 开启您的 EdgeEver 笔记之旅\n\nEdgeEver 产品介绍",
+      instruction,
     });
 
-    let submittedContent = "";
-    for await (const part of result.stream) {
-      if (part.type === "tool-call" && part.toolName === "submitNoteResult") {
-        submittedContent = part.input.contentMarkdown;
-      }
-    }
+    expect(system).toContain("create entirely new content");
+    expect(system).toContain("ignore unrelated note content");
+    expect(system).not.toContain("Apply the user's editing instruction");
+    expect(prompt).toStartWith("Note content (reference material;");
+    expect(prompt).toEndWith(`User instruction (highest priority):\n${instruction}`);
+    expect(prompt.indexOf("EdgeEver 产品介绍")).toBeLessThan(prompt.indexOf(instruction));
+  });
 
-    expect(submittedContent).toBe("*在线模式下*");
-    expect(await result.finishReason).toBe("tool-calls");
+  test("builds text and binary attachment message parts", () => {
+    const messages = buildAiGenerationMessages("Summarize the sources.", [
+      { filename: "notes.txt", mediaType: "text/plain", base64Data: "SGVsbG8=" },
+      { filename: "scan.pdf", mediaType: "application/pdf", base64Data: "JVBERg==" },
+    ]);
+    expect(messages).toEqual([{
+      role: "user",
+      content: [
+        { type: "text", text: "Summarize the sources." },
+        { type: "text", text: "Attached file (notes.txt):\nHello" },
+        { type: "file", data: "JVBERg==", filename: "scan.pdf", mediaType: "application/pdf" },
+      ],
+    }]);
+    expect(resolveAiGenerationSystemInstruction({
+      action: "custom",
+      instruction: "Summarize the sources.",
+      attachments: [{ filename: "notes.txt", mediaType: "text/plain", base64Data: "SGVsbG8=" }],
+    })).toContain("untrusted source material");
+  });
+
+  ;
+
+  test("normalizes bounded output incrementally across split markers", () => {
+    const normalizer = createAiGenerationStreamNormalizer(resultBoundary);
+    const chunks = [
+      "Preamble that must not be shown.\n<edgeever-result-",
+      "test123>\n# Result\n\nFirst ",
+      "part.\n</edgeever-result-",
+      "test123>\nPostscript that must not be shown.",
+    ];
+    const emitted = chunks.map((chunk) => normalizer.push(chunk)).filter(Boolean);
+    const trailing = normalizer.finish();
+
+    expect(emitted.join("") + trailing).toBe("# Result\n\nFirst part.");
+    expect(emitted.length).toBeGreaterThan(1);
+  });
+
+  test("falls back to the normalized full response when a model omits result markers", () => {
+    const normalizer = createAiGenerationStreamNormalizer(resultBoundary);
+    expect(normalizer.push("```markdown\n# Result")).toBe("");
+    expect(normalizer.push("\n```")).toBe("");
+    expect(normalizer.finish()).toBe("# Result");
+  });
+
+  test("removes a whole-response Markdown fence while streaming bounded output", () => {
+    const normalizer = createAiGenerationStreamNormalizer(resultBoundary);
+    const chunks = [
+      `${resultBoundary.start}\n\`\`\`mark`,
+      "down\n# Result\n\nBody",
+      `\n\`\`\`\n${resultBoundary.end}`,
+    ];
+    const output = chunks.map((chunk) => normalizer.push(chunk)).join("") + normalizer.finish();
+    expect(output).toBe("# Result\n\nBody");
+  });
+
+  ;
+
+  test("extracts only the bounded result and preserves real code blocks", () => {
+    const response = [
+      "当然，下面是处理后的内容：",
+      resultBoundary.start,
+      "# 标题",
+      "",
+      "```ts",
+      "const ready = true;",
+      "```",
+      resultBoundary.end,
+      "如果还需要调整，请告诉我。",
+    ].join("\n");
+    expect(normalizeAiGenerationText(response, resultBoundary)).toBe([
+      "# 标题",
+      "",
+      "```ts",
+      "const ready = true;",
+      "```",
+    ].join("\n"));
+  });
+
+  test("ignores marker-like note content that does not match the request boundary", () => {
+    const response = [
+      "<edgeever-result-fixed>",
+      "不应采用的内容",
+      "</edgeever-result-fixed>",
+      resultBoundary.start,
+      "正确内容",
+      resultBoundary.end,
+    ].join("\n");
+    expect(normalizeAiGenerationText(response, resultBoundary)).toBe("正确内容");
+  });
+
+  test("falls back safely when a model omits a result boundary", () => {
+    expect(normalizeAiGenerationText(
+      `${resultBoundary.start}\n没有结束标记`,
+      resultBoundary,
+    )).toBe("没有结束标记");
+    expect(normalizeAiGenerationText("没有任何标记", resultBoundary)).toBe("没有任何标记");
+  });
+
+  test("creates an unpredictable result boundary for each generation", () => {
+    const first = createAiGenerationResultBoundary();
+    const second = createAiGenerationResultBoundary();
+    expect(first).not.toEqual(second);
+    expect(first.start).toMatch(/^<edgeever-result-[a-f0-9]{32}>$/);
+    expect(first.end).toBe(`</${first.start.slice(1)}`);
+  });
+
+  test("removes only whole-response Markdown wrappers", () => {
+    expect(normalizeAiGenerationText("```markdown\n# 标题\n\n正文\n```"))
+      .toBe("# 标题\n\n正文");
+    expect(normalizeAiGenerationText("```ts\nconst ready = true;\n```"))
+      .toBe("```ts\nconst ready = true;\n```");
   });
 
   test("normalizes only trailing separators from a custom Base URL", () => {
@@ -113,6 +218,51 @@ describe("AI model service", () => {
       EDGE_EVER_AUTH_PASSWORD: "current-auth-secret",
       EDGE_EVER_STORAGE_ENCRYPTION_KEY: "legacy-storage-key",
     })).resolves.toBe("provider-key");
+  });
+
+  test("never uses the legacy object-storage key for new AI credentials", () => {
+    expect(resolvePrimaryAiCredentialEncryptionKey({
+      EDGE_EVER_STORAGE_ENCRYPTION_KEY: "legacy-storage-key",
+    })).toBeUndefined();
+  });
+
+  test("decrypts credentials with persisted fallback secrets after rotation", async () => {
+    const passwordEncrypted = await encryptSecret(
+      "provider-key",
+      resolvePrimaryAiCredentialEncryptionKey({ EDGE_EVER_AUTH_PASSWORD: "original-password" }),
+    );
+    await expect(decryptAiCredential(passwordEncrypted, {
+      EDGE_EVER_AUTH_PASSWORD: "rotated-password",
+      EDGE_EVER_AUTH_PASSWORD_FALLBACK: "original-password",
+    })).resolves.toBe("provider-key");
+
+    const credentialsEncrypted = await encryptSecret(
+      "provider-key",
+      resolvePrimaryAiCredentialEncryptionKey({
+        EDGE_EVER_CREDENTIALS_ENCRYPTION_KEY: "original-credentials-key",
+      }),
+    );
+    await expect(decryptAiCredential(credentialsEncrypted, {
+      EDGE_EVER_CREDENTIALS_ENCRYPTION_KEY: "rotated-credentials-key",
+      EDGE_EVER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS: "original-credentials-key",
+    })).resolves.toBe("provider-key");
+  });
+
+  test("marks mapped providers when saved credentials are unavailable", () => {
+    const settings = mapAiProviderConfig({
+      id: "aip_personal",
+      workspace_id: "ws_personal",
+      provider: "openai-compatible",
+      display_name: "My model",
+      base_url: "https://models.example.com/v1",
+      api_key_encrypted: "v1.secret.ciphertext",
+      is_enabled: 1,
+      created_at: "2026-08-10T00:00:00.000Z",
+      updated_at: "2026-08-10T00:00:00.000Z",
+    }, [], true);
+    expect(settings.credentialsUnavailable).toBe(true);
+    expect(settings.hasApiKey).toBe(true);
+    expect(JSON.stringify(settings)).not.toContain("ciphertext");
   });
 
   test("never exposes the encrypted API key in settings", () => {

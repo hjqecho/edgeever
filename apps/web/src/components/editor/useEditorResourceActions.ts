@@ -8,6 +8,7 @@ export type ResourceMenuPosition = {
 
 export type AttachmentMenuTarget = {
   kind: "attachment";
+  element?: HTMLElement;
   url: string;
   filename: string;
   resourceId: string | null;
@@ -16,6 +17,8 @@ export type AttachmentMenuTarget = {
 
 export type ImageMenuTarget = {
   kind: "image";
+  actionsElement?: HTMLElement | null;
+  element?: HTMLElement;
   url: string;
   filename: string;
   resourceId: string | null;

@@ -2,9 +2,7 @@
 
 Native SwiftUI client for EdgeEver. This replaces the React Native / Expo iOS target.
 
-**Design document:** [`docs/ios-swift-rewrite.md`](../../docs/ios-swift-rewrite.md)
-
-**App Store binaries on macOS beta:** use **Xcode Cloud (manual)** — [`docs/ios-xcode-cloud.md`](../../docs/ios-xcode-cloud.md).
+**App Store binaries on macOS beta:** use **Xcode Cloud** — [`docs/ios-xcode-cloud.md`](../../docs/ios-xcode-cloud.md). Formal Releases start Cloud through store-delivery.
 
 ## Status
 
@@ -25,15 +23,13 @@ Android remains Expo / React Native in `apps/mobile`. Store builds for iOS use t
 
 ## Motion / animations
 
-Motion stack: **SwiftUI Animation** (timing / springs) + **[Pow](https://github.com/EmergeTools/Pow)** (Emerge).
+Motion stack: **SwiftUI Animation** (short easing transitions) + **[Pow](https://github.com/EmergeTools/Pow)** (Emerge) for focused feedback.
 
 | Effect | Where |
 |--------|--------|
-| **Jump** (physics hop + squash) | First list open (whole list); create/edit return on that memo |
-| **Boing** (elastic drop-in) | Staggered first-paint cards |
-| **Ping** | Create button / returned memo highlight |
+| Static list cards and press targets | List entry, create/edit return, card / create / filter presses |
+| Short easing transitions | Search, filters, settings, loading states |
 | **Shine / Shake / Haptic** | Pin success, errors, selection |
-| SwiftUI scale press | Card / create / filter finger-down |
 
 Curves & wrappers: `EdgeEver/DesignSystem/Motion.swift`.
 
@@ -89,9 +85,9 @@ xcrun simctl launch booted org.edgeever.mobile \
 
 ## App Store archive
 
-### Preferred: Xcode Cloud (manual only)
+### Preferred: Xcode Cloud
 
-If the Mac runs **macOS beta**, local archives are rejected by App Store Connect (**ITMS-90111**) even with release Xcode. Day-to-day development stays local; **only store / TestFlight binaries** should use **Xcode Cloud** (25 compute hours/month with Apple Developer Program).
+If the Mac runs **macOS beta**, local archives are rejected by App Store Connect (**ITMS-90111**) even with release Xcode. Day-to-day development stays local; **only store / TestFlight binaries** should use **Xcode Cloud** (25 compute hours/month with Apple Developer Program). Formal Releases start Cloud through store-delivery; keep the Cloud workflow start condition **Manual** so git pushes do not consume hours.
 
 - Setup and workflow: **[`docs/ios-xcode-cloud.md`](../../docs/ios-xcode-cloud.md)**
 - Cloud hooks: `ci_scripts/ci_post_clone.sh` → `ci_pre_xcodebuild.sh` → `ci_post_xcodebuild.sh`

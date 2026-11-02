@@ -1,17 +1,297 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   auditReleaseCommitCoverage,
   buildIssueBody,
   buildReleaseNotes,
+  buildReleaseSummary,
   buildReleaseTitle,
+  checkpointRunIds,
+  draftRunResumeAction,
   nextVersion,
+  parseReleaseCheckpoint,
+  updateIosMarketingVersion,
+  updateIosProjectMarketingVersion,
   parseReleaseArgs,
+  playDeliveryResumeAction,
+  playDeliveryFailureStrategy,
+  prepareReleaseCheckpoint,
+  recordCheckpointRun,
+  RELEASE_WORKFLOWS,
+  RELEASE_VALIDATIONS,
   resolveReleaseVersion,
   reusedAssetMatches,
   selectPublishedDmg,
+  signedWindowsUpdateAuditPassed,
+  shouldCancelSupersededRun,
+  waitForRun,
 } from "./release.mjs";
 
 describe("release automation", () => {
+  test("prepares and audits the official Docker image with every formal release", () => {
+    expect(RELEASE_WORKFLOWS.docker).toBe("docker-image.yml");
+  });
+
+  test("dispatches a unified post-release endpoint timing report", () => {
+    expect(RELEASE_WORKFLOWS.timings).toBe("release-timings.yml");
+    const releaseSource = readFileSync(new URL("./release.mjs", import.meta.url), "utf8");
+    expect(releaseSource).toContain("desktop_run_id=\${desktopRunId}");
+    expect(releaseSource).toContain("mobile_run_id=\${mobileRunId}");
+    expect(releaseSource).toContain("docker_run_id=\${dockerRunId}");
+    expect(releaseSource).toContain("store_run_id=\${timingStoreRunId}");
+    expect(releaseSource).toContain("attempt_run_ids=\${timingAttemptRunIds}");
+    expect(releaseSource).toContain("endpoint timing report continues in background");
+  });
+
+  test("blocks publication until the Draft Android APK passes the Play signature gate", () => {
+    const releaseSource = readFileSync(new URL("./release.mjs", import.meta.url), "utf8");
+    const signatureGate = releaseSource.indexOf('label: "Draft Android Play signature gate"');
+    const publication = releaseSource.indexOf('"--draft=false"');
+
+    expect(RELEASE_WORKFLOWS.androidPlaySignature).toBe("android-play-signature-audit.yml");
+    expect(signatureGate).toBeGreaterThanOrEqual(0);
+    expect(publication).toBeGreaterThan(signatureGate);
+  });
+
+  test("blocks publication until the offline-signed Windows update passes an independent audit", () => {
+    const releaseSource = readFileSync(new URL("./release.mjs", import.meta.url), "utf8");
+    const signing = releaseSource.indexOf("signDraftWindowsUpdate({");
+    const audit = releaseSource.indexOf('label: "Draft signed Windows update audit"');
+    const publication = releaseSource.indexOf('"--draft=false"');
+    expect(signing).toBeGreaterThanOrEqual(0);
+    expect(audit).toBeGreaterThan(signing);
+    expect(publication).toBeGreaterThan(audit);
+  });
+
+  test("requires the signed Windows audit job instead of accepting a rebuild-only workflow", () => {
+    expect(signedWindowsUpdateAuditPassed({
+      jobs: [{ name: "Audit signed Windows update", conclusion: "success" }],
+    })).toBe(true);
+    expect(signedWindowsUpdateAuditPassed({
+      jobs: [
+        { name: "Audit signed Windows update", conclusion: "skipped" },
+        { name: "Finalize desktop release assets", conclusion: "success" },
+      ],
+    })).toBe(false);
+  });
+
+  test("checks the offline Windows key before creating release state", () => {
+    const releaseSource = readFileSync(new URL("./release.mjs", import.meta.url), "utf8");
+    const releaseMain = releaseSource.indexOf("const releaseMain = async");
+    const keyCheck = releaseSource.indexOf("assertWindowsUpdateSigningKey({", releaseMain);
+    const issueCreation = releaseSource.indexOf('"issue",\n      "create"', releaseMain);
+    expect(keyCheck).toBeGreaterThan(releaseMain);
+    expect(issueCreation).toBeGreaterThan(keyCheck);
+  });
+
+  test("starts Play delivery as soon as Android preparation finishes", () => {
+    const releaseSource = readFileSync(new URL("./release.mjs", import.meta.url), "utf8");
+    const androidReady = releaseSource.lastIndexOf("const androidReleaseReady");
+    const mobileWait = releaseSource.indexOf('label: "Draft Android assets"', androidReady);
+    const playDelivery = releaseSource.indexOf("await ensurePlayDelivery", androidReady);
+    const allDraftGates = releaseSource.indexOf("await Promise.all", androidReady);
+
+    expect(RELEASE_WORKFLOWS.storeDelivery).toBe("store-delivery.yml");
+    expect(mobileWait).toBeGreaterThan(androidReady);
+    expect(playDelivery).toBeGreaterThan(mobileWait);
+    expect(playDelivery).toBeLessThan(allDraftGates);
+  });
+
+  test("starts App Store delivery from the native iOS tree without blocking GitHub publication", () => {
+    const releaseSource = readFileSync(new URL("./release.mjs", import.meta.url), "utf8");
+    const iosPlan = releaseSource.indexOf('planNativeRelease("ios"');
+    const iosDispatch = releaseSource.indexOf("startIosStoreDelivery(");
+    const publication = releaseSource.indexOf('"--draft=false"');
+    const iosWait = releaseSource.indexOf('label: "App Store delivery"');
+    const restoreDraft = releaseSource.lastIndexOf('"--draft=true"');
+    const issueClose = releaseSource.indexOf('"issue",\n    "close"', publication);
+
+    expect(iosPlan).toBeGreaterThan(0);
+    expect(iosDispatch).toBeGreaterThan(iosPlan);
+    expect(iosDispatch).toBeLessThan(publication);
+    expect(iosWait).toBeGreaterThan(publication);
+    expect(iosWait).toBeGreaterThan(restoreDraft);
+    expect(issueClose).toBeGreaterThan(restoreDraft);
+    expect(issueClose).toBeLessThan(iosWait);
+    expect(releaseSource).toContain("is closed; App Store delivery failed");
+    expect(releaseSource).toContain('platform: "ios"');
+    expect(releaseSource).toContain("iosRebuild: iosPlan.rebuild");
+    expect(releaseSource).toContain("updateIosMarketingVersion");
+  });
+
+  test("rewrites the iOS marketing version onto the Release tag", () => {
+    expect(
+      updateIosMarketingVersion(
+        "// comment\nMARKETING_VERSION = 1.74.0\nCURRENT_PROJECT_VERSION = 49\n",
+        "1.79.0",
+      ),
+    ).toContain("MARKETING_VERSION = 1.79.0");
+  });
+
+  test("keeps the generated iOS project aligned with the Release tag", () => {
+    const updated = updateIosProjectMarketingVersion(
+      [
+        "MARKETING_VERSION = 1.79.0;",
+        "MARKETING_VERSION = 1.79.0;",
+      ].join("\n"),
+      "1.80.0",
+    );
+
+    expect(updated.match(/MARKETING_VERSION = 1\.80\.0;/g)).toHaveLength(2);
+    expect(updated).not.toContain("MARKETING_VERSION = 1.79.0;");
+  });
+
+  test("restores an exact Draft checkpoint without exposing it in Issue text", () => {
+    const checkpoint = { releaseSha: "abc", desktopRunId: 123 };
+    const body = `<!-- edgeever-release-checkpoint:v1.42.0\n${JSON.stringify(checkpoint)}\n-->`;
+    expect(parseReleaseCheckpoint(body, "v1.42.0")).toEqual(checkpoint);
+    expect(parseReleaseCheckpoint(body, "v1.42.1")).toBeNull();
+    expect(parseReleaseCheckpoint("malformed", "v1.42.0")).toBeNull();
+  });
+
+  test("preserves Play delivery and Run history when a Draft target advances", () => {
+    const storedState = {
+      releaseSha: "old",
+      desktopRunId: 11,
+      storeRunId: 12,
+      playDelivery: { tag: "v1.42.0", releaseSha: "old", storeRunId: 12 },
+    };
+    const checkpoint = prepareReleaseCheckpoint({ storedState, releaseSha: "new" });
+    expect(checkpoint).toMatchObject({
+      releaseSha: "new",
+      playDelivery: storedState.playDelivery,
+      runHistory: [
+        { field: "desktopRunId", runId: 11, releaseSha: "old" },
+        { field: "storeRunId", runId: 12, releaseSha: "old" },
+      ],
+    });
+    expect(checkpoint.desktopRunId).toBeUndefined();
+    recordCheckpointRun(checkpoint, "mobileRunId", 13);
+    recordCheckpointRun(checkpoint, "mobileRunId", 13);
+    expect(checkpointRunIds(checkpoint)).toEqual([11, 12, 13]);
+  });
+
+  test("keeps an active App Store delivery when a Draft advances without iOS changes", () => {
+    const storedState = {
+      releaseSha: "old",
+      desktopRunId: 11,
+      iosStoreRunId: 12,
+    };
+    const checkpoint = prepareReleaseCheckpoint({
+      storedState,
+      releaseSha: "new",
+      preserveIosStoreRun: true,
+    });
+    expect(checkpoint.iosStoreRunId).toBe(12);
+    expect(checkpoint.desktopRunId).toBeUndefined();
+    expect(checkpoint.runHistory).toContainEqual({
+      field: "iosStoreRunId",
+      runId: 12,
+      releaseSha: "old",
+    });
+  });
+
+  test("verifies an immutable Play delivery without uploading across mobile-compatible fixes", () => {
+    const playDelivery = { tag: "v1.42.0", releaseSha: "old" };
+    expect(playDeliveryResumeAction({
+      playDelivery,
+      tag: "v1.42.0",
+      headSha: "old",
+    })).toBe("verify");
+    expect(playDeliveryResumeAction({
+      playDelivery,
+      tag: "v1.42.0",
+      headSha: "new",
+      mobileInputsChanged: false,
+    })).toBe("verify");
+    expect(playDeliveryResumeAction({
+      playDelivery,
+      tag: "v1.42.0",
+      headSha: "new",
+      mobileInputsChanged: true,
+    })).toBe("block");
+    expect(playDeliveryResumeAction({
+      playDelivery,
+      tag: "v1.43.0",
+      headSha: "new",
+    })).toBe("upload");
+  });
+
+  test("cancels only active Runs from superseded release targets", () => {
+    expect(shouldCancelSupersededRun({
+      runView: { headSha: "old", status: "in_progress" },
+      headSha: "new",
+    })).toBe(true);
+    expect(shouldCancelSupersededRun({
+      runView: { headSha: "old", status: "completed" },
+      headSha: "new",
+    })).toBe(false);
+    expect(shouldCancelSupersededRun({
+      runView: { headSha: "new", status: "in_progress" },
+      headSha: "new",
+    })).toBe(false);
+  });
+
+  test("reuses successful Draft runs and reruns only failed ones", () => {
+    const headSha = "abc";
+    expect(draftRunResumeAction({
+      runId: 1,
+      runView: { headSha, status: "completed", conclusion: "success" },
+      headSha,
+    })).toBe("reuse");
+    expect(draftRunResumeAction({
+      runId: 2,
+      runView: { headSha, status: "completed", conclusion: "failure" },
+      headSha,
+    })).toBe("rerun");
+    expect(draftRunResumeAction({
+      runId: 3,
+      runView: { headSha: "different", status: "completed", conclusion: "success" },
+      headSha,
+    })).toBe("dispatch");
+  });
+
+  test("only retries a Play delivery when upload definitely did not start", () => {
+    const run = (conclusion) => ({
+      jobs: [{
+        name: "Deliver Google Play",
+        steps: [{ name: "Upload bundle to Google Play", conclusion }],
+      }],
+    });
+    expect(playDeliveryFailureStrategy(run("skipped"))).toBe("rerun");
+    expect(playDeliveryFailureStrategy(run("success"))).toBe("recover");
+    expect(playDeliveryFailureStrategy(run("failure"))).toBe("recover");
+  });
+
+  test("runs the complete project regression suite before release", () => {
+    expect(RELEASE_VALIDATIONS).toContainEqual({
+      label: "Project regression tests",
+      args: ["run", "test"],
+    });
+  });
+
+  test("retries transient GitHub status failures while waiting for a workflow", async () => {
+    let attempts = 0;
+    let polls = 0;
+    const result = await waitForRun({
+      repository: "tianma-if/edgeever",
+      runId: 123,
+      label: "Draft assets",
+      viewRun: () => {
+        attempts += 1;
+        if (attempts < 3) throw new Error("transient EOF");
+        return { status: "completed", conclusion: "success", url: "https://example.test/run" };
+      },
+      waitForNextPoll: async () => {
+        polls += 1;
+      },
+    });
+
+    expect(result.conclusion).toBe("success");
+    expect(attempts).toBe(3);
+    expect(polls).toBe(2);
+  });
+
   test("parses paired bilingual changes and labels", () => {
     expect(
       parseReleaseArgs([
@@ -25,6 +305,8 @@ describe("release automation", () => {
         "Run checks in parallel.",
         "--change-zh",
         "并行运行检查。",
+        "--change-locale",
+        "ja-JP:チェックを並列実行します。",
         "--change-commit",
         "abc1234",
       ]),
@@ -34,8 +316,75 @@ describe("release automation", () => {
       labels: ["enhancement"],
       changesEn: ["Run checks in parallel."],
       changesZh: ["并行运行检查。"],
+      localizedChanges: { "ja-JP": ["チェックを並列実行します。"] },
       changeCommits: ["abc1234"],
     });
+  });
+
+  test("keeps post-release desktop installation explicitly opt-in", () => {
+    expect(parseReleaseArgs([
+      "--issue-title", "Release",
+      "--bump", "patch",
+      "--label", "maintenance",
+      "--change-en", "Update the release flow.",
+      "--change-zh", "更新发布流程。",
+      "--change-locale", "ja:リリースフローを更新します。",
+      "--change-commit", "abc1234",
+    ])).toMatchObject({ installDesktop: false });
+    expect(parseReleaseArgs([
+      "--issue-title", "Release",
+      "--bump", "patch",
+      "--label", "maintenance",
+      "--change-en", "Update the release flow.",
+      "--change-zh", "更新发布流程。",
+      "--change-locale", "ja:リリースフローを更新します。",
+      "--change-commit", "abc1234",
+      "--install-desktop",
+    ])).toMatchObject({ installDesktop: true });
+  });
+
+  test("accepts optional contributors and deduplicates GitHub usernames", () => {
+    const args = [
+      "--issue-title", "Release",
+      "--bump", "patch",
+      "--label", "maintenance",
+      "--change-en", "Update the release flow.",
+      "--change-zh", "更新发布流程。",
+      "--change-locale", "ja:リリースフローを更新します。",
+      "--change-commit", "abc1234",
+    ];
+    expect(parseReleaseArgs(args).contributors).toEqual([]);
+    expect(parseReleaseArgs([
+      ...args,
+      "--contributor", " @Alice ",
+      "--contributor", "alice",
+      "--contributor", "bob-smith",
+    ]).contributors).toEqual(["Alice", "bob-smith"]);
+    for (const username of ["alice,bob", "https://github.com/alice", "@@alice", "-alice", "alice-", "a--b", "a".repeat(40), "alice\n@bob", "bot[bot]"]) {
+      expect(() => parseReleaseArgs([...args, "--contributor", username]))
+        .toThrow("Invalid --contributor GitHub username");
+    }
+    expect(() => parseReleaseArgs([...args, "--contributor"]))
+      .toThrow("--contributor requires a value");
+  });
+
+  test("requires Japanese App Store What's New", () => {
+    expect(() =>
+      parseReleaseArgs([
+        "--issue-title",
+        "Missing Japanese notes",
+        "--bump",
+        "patch",
+        "--label",
+        "bug",
+        "--change-en",
+        "Fix a bug.",
+        "--change-zh",
+        "修复问题。",
+        "--change-commit",
+        "abc1234",
+      ]),
+    ).toThrow("--change-locale ja is required");
   });
 
   test("rejects mismatched bilingual changes", () => {
@@ -80,6 +429,24 @@ describe("release automation", () => {
       resumedDraft: draftCandidate,
       withdrawnDraft: null,
     });
+  });
+
+  test("resumes replacement Drafts after earlier version numbers were reserved", () => {
+    for (const [bump, packageVersion] of [["patch", "1.17.2"], ["minor", "1.19.0"], ["major", "3.0.0"]]) {
+      const draftCandidate = {
+        tagName: `v${packageVersion}`, isDraft: true, isPrerelease: false,
+        targetCommitish: "current-head",
+      };
+      expect(resolveReleaseVersion({
+        previousVersion: "1.17.0", packageVersion, bump,
+        headSha: "current-head", draftCandidate,
+      })).toMatchObject({ releaseVersion: packageVersion, resumedDraft: draftCandidate, releaseBaseTag: "v1.17.0" });
+    }
+    expect(() => resolveReleaseVersion({
+      previousVersion: "1.17.0", packageVersion: "1.19.0", bump: "patch",
+      headSha: "current-head",
+      draftCandidate: { tagName: "v1.19.0", isDraft: true, isPrerelease: false, targetCommitish: "current-head" },
+    })).toThrow("cannot resume");
   });
 
   test("reserves a withdrawn Draft version and keeps the published audit baseline", () => {
@@ -148,16 +515,68 @@ describe("release automation", () => {
       changesZh: ["优化发布流程。"],
       issueNumber: 126,
     });
+    expect(notes).toContain("## 主要更新");
     expect(notes).toContain("## Key Changes");
     expect(notes).toContain("Related Issue: #126");
-    expect(notes).toContain("## 🇨🇳 中文说明 / Chinese Changelog");
     expect(notes).toContain("关联 Issue：#126");
+    expect(notes).not.toContain("中文说明");
+    expect(notes).not.toContain("Chinese Changelog");
+    expect(notes.indexOf("## 主要更新"))
+      .toBeLessThan(notes.indexOf("## Key Changes"));
+    expect(notes.indexOf("优化发布流程。"))
+      .toBeLessThan(notes.indexOf("Improve the release flow."));
     expect(notes).not.toContain("## Verification");
+    expect(notes).not.toContain("Contributors");
     expect(notes).not.toContain("## 验证");
     expect(notes).not.toContain("bun run");
     expect(notes).not.toContain("Version bump");
     expect(notes).not.toContain("release plan");
     expect(notes).not.toContain("\\n");
+  });
+
+  test("appends manually selected contributors after unchanged bilingual notes", () => {
+    const options = {
+      changesEn: ["Improve the release flow."],
+      changesZh: ["优化发布流程。"],
+      issueNumber: 126,
+    };
+    const original = buildReleaseNotes(options);
+    expect(buildReleaseNotes({ ...options, contributors: [] })).toBe(original);
+    expect(buildReleaseNotes({
+      ...options,
+      contributors: ["@Alice", "alice", "bob-smith"],
+    })).toBe(`${original}\n贡献者 / Contributors：@Alice @bob-smith\n`);
+    expect(() => buildReleaseNotes({ ...options, contributors: ["alice\n@bob"] }))
+      .toThrow("Invalid --contributor GitHub username");
+  });
+
+  test("builds the in-app summary from the same bilingual release changes", () => {
+    expect(buildReleaseSummary({
+      version: "1.6.55",
+      changesEn: ["Improve the release flow."],
+      changesZh: ["优化发布流程。"],
+      localizedChanges: { "ja-JP": ["リリースフローを改善します。"] },
+    })).toEqual({
+      version: "1.6.55",
+      changes: {
+        "en-US": ["Improve the release flow."],
+        "zh-CN": ["优化发布流程。"],
+        "ja-JP": ["リリースフローを改善します。"],
+      },
+    });
+  });
+
+  test("persists localized in-app release changes when preparing versions", () => {
+    const releaseSource = readFileSync(new URL("./release.mjs", import.meta.url), "utf8");
+    const updateCall = releaseSource.indexOf("const versionPaths = updateReleaseVersions({");
+    const localizedChanges = releaseSource.indexOf(
+      "localizedChanges: options.localizedChanges",
+      updateCall,
+    );
+    const updateCallEnd = releaseSource.indexOf("});", updateCall);
+    expect(updateCall).toBeGreaterThanOrEqual(0);
+    expect(localizedChanges).toBeGreaterThan(updateCall);
+    expect(localizedChanges).toBeLessThan(updateCallEnd);
   });
 
   test("builds a bilingual umbrella Issue", () => {
@@ -180,6 +599,9 @@ describe("release automation", () => {
     expect(body).toContain("## 中文说明");
     expect(body).toContain("- 并行检查。");
     expect(body).toContain("## Commit coverage audit");
+    expect(body).toContain("Play-signed Android arm64 APK");
+    expect(body).toContain("unsigned Windows x64 Preview");
+    expect(body).toContain("Linux x64 AppImage Preview");
     expect(body).toContain("- Change 1: `aaaaaaaa`");
     expect(body).toContain("- Excluded `bbbbbbbb`: test-only coverage");
   });

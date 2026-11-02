@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { globSync, readFileSync } from "node:fs";
 import { Database } from "bun:sqlite";
 import { Hono } from "hono";
-import { AI_ACTIONS, AiGenerateSchema } from "@edgeever/shared";
+import {
+  AI_ACTIONS,
+  AiGenerateSchema,
+  AiTagSuggestionsRequestSchema,
+} from "@edgeever/shared";
 import { registerAiRoutes } from "./ai-routes.ts";
 
 const auth = {
@@ -24,7 +28,7 @@ const environment = {
     },
     resources: {},
   },
-  EDGE_EVER_STORAGE_ENCRYPTION_KEY: "x".repeat(32),
+  EDGE_EVER_AUTH_PASSWORD: "x".repeat(32),
 };
 
 class SqliteD1PreparedStatement {
@@ -78,18 +82,18 @@ const createDatabaseEnvironment = () => {
     sqlite,
     environment: {
       storage: { db: new SqliteD1Database(sqlite), resources: {} },
-      EDGE_EVER_STORAGE_ENCRYPTION_KEY: "x".repeat(32),
+      EDGE_EVER_AUTH_PASSWORD: "x".repeat(32),
     },
   };
 };
 
-const createApp = ({ currentAuth = auth, demoMode = false, testConnection } = {}) => {
+const createApp = ({ currentAuth = auth, demoMode = false, suggestTags, testConnection, generateVideoOutline } = {}) => {
   const app = new Hono();
   app.use("/api/v1/*", async (context, next) => {
     context.set("auth", currentAuth);
     await next();
   });
-  registerAiRoutes(app, { isDemoMode: () => demoMode, testConnection });
+  registerAiRoutes(app, { isDemoMode: () => demoMode, suggestTags, testConnection, generateVideoOutline });
   return app;
 };
 
@@ -103,6 +107,49 @@ const validSettings = {
 };
 
 describe("AI route contracts", () => {
+  test("speech settings stay encrypted and transcription requires a note-owned resource", async () => {
+    const app = createApp();
+    const { environment: databaseEnvironment } = createDatabaseEnvironment();
+    const saved = await app.request(
+      "/api/v1/ai/transcription-providers",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...validSettings, initialModelId: "whisper-1" }),
+      },
+      databaseEnvironment,
+    );
+    expect(saved.status).toBe(201);
+    const settings = await saved.json();
+    expect(JSON.stringify(settings)).not.toContain("secret");
+
+    const credentialPath = `/api/v1/ai/transcription-providers/${settings.providers[0].id}/direct-credential`;
+    const credential = await app.request(credentialPath, { method: "POST" }, databaseEnvironment);
+    expect(credential.status).toBe(200);
+    expect(credential.headers.get("Cache-Control")).toBe("no-store");
+    expect(await credential.json()).toEqual({ apiKey: "secret" });
+
+    const transcript = await app.request(
+      "/api/v1/memos/missing/resources/missing/transcription-target",
+      { method: "POST" },
+      databaseEnvironment,
+    );
+    expect(transcript.status).toBe(404);
+
+    const scopedApp = createApp({ currentAuth: { ...auth, kind: "agent", scopes: ["read:resources"] } });
+    const denied = await scopedApp.request(
+      "/api/v1/memos/missing/resources/missing/transcription-target",
+      { method: "POST" },
+      databaseEnvironment,
+    );
+    expect(denied.status).toBe(403);
+    const deniedCredential = await scopedApp.request(credentialPath, { method: "POST" }, databaseEnvironment);
+    expect(deniedCredential.status).toBe(403);
+    const otherWorkspaceApp = createApp({ currentAuth: { ...auth, workspaceId: "ws_other" } });
+    const otherWorkspaceCredential = await otherWorkspaceApp.request(credentialPath, { method: "POST" }, databaseEnvironment);
+    expect(otherWorkspaceCredential.status).toBe(404);
+  });
+
   test("accepts the shared semantic action catalog with required parameters", () => {
     for (const action of AI_ACTIONS) {
       const parsed = AiGenerateSchema.safeParse({
@@ -117,11 +164,133 @@ describe("AI route contracts", () => {
     }
   });
 
+  test("defaults AI generation to non-streaming and accepts an explicit opt-in", () => {
+    const input = { action: "summarize", title: "Note", contentMarkdown: "Body" };
+    expect(AiGenerateSchema.parse(input).stream).toBe(false);
+    expect(AiGenerateSchema.parse({ ...input, stream: true }).stream).toBe(true);
+  });
+
+  test("allows custom generation from an empty note while source-based actions still require content", async () => {
+    expect(AiGenerateSchema.safeParse({
+      action: "custom",
+      title: "",
+      contentMarkdown: "",
+      instruction: "Write a friendly greeting email.",
+    }).success).toBe(true);
+    expect(AiGenerateSchema.safeParse({
+      action: "custom",
+      promptId: "aiprompt_blank_note_generator",
+      title: "",
+      contentMarkdown: "",
+    }).success).toBe(true);
+    expect(AiGenerateSchema.safeParse({
+      action: "summarize",
+      title: "",
+      contentMarkdown: "",
+    }).success).toBe(false);
+
+    const app = createApp();
+    const response = await app.request(
+      "/api/v1/ai/generate/prepare",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "summarize", title: "", contentMarkdown: "" }),
+      },
+      environment,
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "ai_source_required",
+        message: "Note content is required for this AI action.",
+      },
+    });
+  });
+
+  test("validates AI tag suggestion inputs without requiring saved note content", () => {
+    expect(AiTagSuggestionsRequestSchema.safeParse({
+      title: "Unsaved title",
+      contentMarkdown: "",
+      currentTags: ["draft"],
+      locale: "en-US",
+    }).success).toBe(true);
+    expect(AiTagSuggestionsRequestSchema.safeParse({
+      title: "",
+      contentMarkdown: "   ",
+    }).success).toBe(false);
+  });
+
+  test("retired model generation endpoints reject even configured server generators", async()=>{
+ let called=0;const app=createApp({suggestTags:async()=>{called++;return [];},testConnection:async()=>{called++;return {text:"OK"};},generateVideoOutline:async()=>{called++;return '{}';}});
+ for(const path of ["/api/v1/ai/tag-suggestions","/api/v1/ai/generate","/api/v1/ai/infographic-agent","/api/v1/ai/providers/provider/test","/api/v1/ai/providers/provider/discover-models","/api/v1/ai/video-outline"]){const res=await app.request(path,{method:"POST",headers:{"content-type":"application/json"},body:"{}"},environment);expect(res.status).toBe(410);expect(await res.json()).toMatchObject({error:{code:"ai_client_required"}});}expect(called).toBe(0);
+});
+
+  ;
+
+  test("prepares tag suggestions with model credentials and no provider call", async () => {
+    const app = createApp();
+    const { environment: databaseEnvironment } = createDatabaseEnvironment();
+    const created = await app.request(
+      "/api/v1/ai/providers",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(validSettings),
+      },
+      databaseEnvironment,
+    );
+    expect(created.status).toBe(201);
+    const response = await app.request(
+      "/api/v1/ai/tag-suggestions/prepare",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "Note", contentMarkdown: "Body about React", currentTags: ["Current"] }),
+      },
+      databaseEnvironment,
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.apiKey).toBe("secret");
+    expect(body.prompt).toContain("Body about React");
+    expect(body.currentTags).toEqual(["Current"]);
+    expect(body.maxOutputTokens).toBe(300);
+  });
+
+  test("defers prompt-specific action and parameter validation to the saved prompt", () => {
+    expect(AiGenerateSchema.safeParse({
+      action: "custom",
+      promptId: "aiprompt_saved",
+      title: "Note",
+      contentMarkdown: "Body",
+    }).success).toBe(true);
+    expect(AiGenerateSchema.safeParse({
+      action: "translate",
+      promptId: "aiprompt_server_resolves_behavior",
+      title: "Note",
+      contentMarkdown: "Body",
+    }).success).toBe(true);
+  });
+
   test("does not allow API tokens to manage personal AI credentials", async () => {
     const app = createApp({ currentAuth: { ...auth, kind: "agent", actorType: "agent" } });
     const response = await app.request("/api/v1/ai/settings", {}, environment);
     expect(response.status).toBe(403);
     expect(await response.json()).toMatchObject({ error: { code: "forbidden" } });
+  });
+
+  test("requires a user session and valid candidates for the infographic agent", async () => {
+    const payload = { prompt: "做个列表", currentContent: "", candidates: ["list-grid-simple"], history: [] };
+    const tokenApp = createApp({ currentAuth: { ...auth, kind: "agent", actorType: "agent" } });
+    const forbidden = await tokenApp.request("/api/v1/ai/infographic-agent/prepare", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload),
+    }, environment);
+    expect(forbidden.status).toBe(403);
+    const invalid = await createApp().request("/api/v1/ai/infographic-agent/prepare", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...payload, candidates: [] }),
+    }, environment);
+    expect(invalid.status).toBe(400);
   });
 
   test("keeps demo AI settings immutable", async () => {
@@ -153,10 +322,69 @@ describe("AI route contracts", () => {
     expect(response.status).toBe(400);
   });
 
+  test("prepares a direct generation payload without calling the model provider", async () => {
+    const app = createApp();
+    const { environment: databaseEnvironment } = createDatabaseEnvironment();
+    const created = await app.request(
+      "/api/v1/ai/providers",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(validSettings),
+      },
+      databaseEnvironment,
+    );
+    expect(created.status).toBe(201);
+
+    const response = await app.request(
+      "/api/v1/ai/generate/prepare",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "summarize", title: "Note", contentMarkdown: "Body" }),
+      },
+      databaseEnvironment,
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.apiKey).toBe("secret");
+    expect(body.provider).toBe("openai-compatible");
+    expect(body.baseUrl).toBe("https://models.example.com/v1");
+    expect(body.modelId).toBe("model-a");
+    expect(body.prompt).toContain("Body");
+    expect(body.system).toContain(body.resultBoundary.start);
+    expect(body.system).toContain(body.resultBoundary.end);
+  });
+
+  test("returns the default model endpoint without the API key", async () => {
+    const app = createApp();
+    const { environment: databaseEnvironment } = createDatabaseEnvironment();
+    const created = await app.request(
+      "/api/v1/ai/providers",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(validSettings),
+      },
+      databaseEnvironment,
+    );
+    expect(created.status).toBe(201);
+
+    const response = await app.request("/api/v1/ai/direct-target", {}, databaseEnvironment);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({
+      provider: "openai-compatible",
+      baseUrl: "https://models.example.com/v1",
+      modelId: "model-a",
+    });
+    expect(body.apiKey).toBeUndefined();
+  });
+
   test("rejects actions outside the shared note-processing catalog", async () => {
     const app = createApp();
     const response = await app.request(
-      "/api/v1/ai/generate",
+      "/api/v1/ai/generate/prepare",
       {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -170,7 +398,7 @@ describe("AI route contracts", () => {
   test("requires a target language for translation", async () => {
     const app = createApp();
     const response = await app.request(
-      "/api/v1/ai/generate",
+      "/api/v1/ai/generate/prepare",
       {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -181,10 +409,58 @@ describe("AI route contracts", () => {
     expect(response.status).toBe(400);
   });
 
+  test("resolves saved prompt behavior inside the authenticated workspace", async () => {
+    const app = createApp();
+    const { sqlite, environment: databaseEnvironment } = createDatabaseEnvironment();
+    const now = "2026-08-12T01:00:00.000Z";
+    sqlite.query(
+      `INSERT INTO ai_prompt_templates (
+         id, workspace_id, seed_key, action, parameter_kind, result_mode,
+         name, description, instruction,
+         name_customized, description_customized, instruction_customized,
+         created_at, updated_at
+       ) VALUES (?, ?, NULL, 'custom', 'tone', 'replace', ?, NULL, ?, 1, 1, 1, ?, ?)`,
+    ).run("aiprompt_tone", auth.workspaceId, "Tone prompt", "Use the requested tone.", now, now);
+
+    const missingParameter = await app.request(
+      "/api/v1/ai/generate/prepare",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          action: "summarize",
+          promptId: "aiprompt_tone",
+          title: "Note",
+          contentMarkdown: "Body",
+        }),
+      },
+      databaseEnvironment,
+    );
+    expect(missingParameter.status).toBe(400);
+    expect(await missingParameter.json()).toMatchObject({ error: { code: "ai_tone_required" } });
+
+    const missingPrompt = await app.request(
+      "/api/v1/ai/generate/prepare",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          action: "custom",
+          promptId: "aiprompt_other_workspace",
+          title: "Note",
+          contentMarkdown: "Body",
+        }),
+      },
+      databaseEnvironment,
+    );
+    expect(missingPrompt.status).toBe(404);
+    expect(await missingPrompt.json()).toMatchObject({ error: { code: "ai_prompt_not_found" } });
+  });
+
   test("bounds custom editing instructions", async () => {
     const app = createApp();
     const response = await app.request(
-      "/api/v1/ai/generate",
+      "/api/v1/ai/generate/prepare",
       {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -290,7 +566,7 @@ describe("AI route contracts", () => {
     const provider = created.providers[0];
 
     const testResponse = await app.request(
-      `/api/v1/ai/providers/${provider.id}/test`,
+      `/api/v1/ai/providers/${provider.id}/direct-credential`,
       {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -305,13 +581,13 @@ describe("AI route contracts", () => {
     );
 
     expect(testResponse.status).toBe(200);
-    expect(await testResponse.json()).toEqual({ ok: true, response: "OK" });
-    expect(testedConnections).toEqual([{
+    expect(testedConnections).toEqual([]);
+    expect(await testResponse.json()).toEqual({
       modelId: "draft-model",
       provider: "google",
       baseUrl: "https://draft.example.com/v1",
       apiKey: "draft-key",
-    }]);
+    });
     expect((await app.request("/api/v1/ai/settings", {}, databaseEnvironment).then((response) => response.json())).providers[0])
       .toMatchObject({
         provider: validSettings.provider,
@@ -330,4 +606,34 @@ describe("AI route contracts", () => {
     expect(await response.json()).toMatchObject({ readOnly: true });
     sqlite.close();
   });
+});
+
+const videoOutlineBody = (overrides = {}) => ({
+  platform: "youtube",
+  title: "Current video",
+  author: "Channel",
+  duration: 90,
+  hasChapters: false,
+  blocks: [
+    { start: 0, text: "Hello world" },
+    { start: 45, text: "Second block" },
+  ],
+  ...overrides,
+});
+
+describe("video outline", () => {
+  test("retired video outline endpoint keeps authorization and never returns model credentials", async()=>{
+ const response=await createApp({currentAuth:null}).request("/api/v1/ai/video-outline",{method:"POST"},environment);expect(response.status).toBe(401);
+ const res=await createApp().request("/api/v1/ai/video-outline",{method:"POST"},environment);expect(res.status).toBe(410);expect(await res.text()).not.toContain("apiKey");
+});
+
+  ;
+
+  test("outline preparation requires a configured model without invoking generation",async()=>{
+ const {sqlite,environment:env}=createDatabaseEnvironment();const response=await createApp().request("/api/v1/ai/video-outline/prepare",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(videoOutlineBody())},env);expect(response.status).toBe(409);expect(await response.json()).toMatchObject({error:{code:"ai_not_configured"}});sqlite.close();
+});
+
+  test("outline preparation rejects oversized transcripts before loading credentials",async()=>{
+ const input=videoOutlineBody();input.blocks=Array.from({length:10},(_,i)=>({start:i,text:"x".repeat(6000)}));const res=await createApp().request("/api/v1/ai/video-outline/prepare",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(input)},environment);expect(res.status).toBe(413);
+});
 });

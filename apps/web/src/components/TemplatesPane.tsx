@@ -1,73 +1,85 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import {
-  BookOpen,
-  Calendar,
   Check,
-  CheckSquare,
   ChevronLeft,
+  Copy,
   Eye,
-  FileText,
   LayoutList,
   Pencil,
   Plus,
   Sparkles,
-  Sun,
   Trash2,
   X,
-  Zap,
   Tag,
   ArrowRight,
-  FilePlus
+  FilePlus,
+  LibraryBig
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { marked } from "marked";
+import { safeMarkdownPreview } from "@/lib/safe-markdown-preview";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { getMemoTemplates, type MemoTemplate } from "@/lib/app-helpers";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { WORKSPACE_PAGE_TITLE_CLASSNAME } from "@/lib/workspace-ui";
+import { copyTextToClipboard } from "@/lib/clipboard";
+import { createTemplateCards, createTemplateDraft, templateDraftToPayload } from "@/lib/template-center";
+import { listMemoTemplateGallery, type MemoTemplateGalleryEntry } from "@edgeever/shared/memo-template-gallery";
+import { ClipboardCopyNotice } from "@/components/ClipboardCopyNotice";
 import type { MemoTemplate as SavedMemoTemplate } from "@edgeever/shared";
+import { ExecutionCenterButton } from "@/components/execution/ExecutionCenterButton";
 
-const renderTemplateIcon = (iconName?: string) => {
-  switch (iconName) {
-    case "zap":
-      return <Zap className="h-4.5 w-4.5 text-amber-600" />;
-    case "calendar":
-      return <Calendar className="h-4.5 w-4.5 text-blue-600" />;
-    case "checklist":
-      return <CheckSquare className="h-4.5 w-4.5 text-emerald-600" />;
-    case "book":
-      return <BookOpen className="h-4.5 w-4.5 text-purple-600" />;
-    case "sun":
-      return <Sun className="h-4.5 w-4.5 text-rose-600" />;
-    default:
-      return <FileText className="h-4.5 w-4.5 text-emerald-700" />;
-  }
-};
+const TemplateIconAction = ({
+  children,
+  className,
+  disabled,
+  label,
+  onClick,
+}: {
+  children: ReactNode;
+  className: string;
+  disabled?: boolean;
+  label: string;
+  onClick: (event: MouseEvent<HTMLButtonElement>) => void;
+}) => (
+  <Tooltip>
+    <TooltipTrigger asChild>
+      <button
+        aria-label={label}
+        className={className}
+        disabled={disabled}
+        onClick={onClick}
+        type="button"
+      >
+        {children}
+      </button>
+    </TooltipTrigger>
+    <TooltipContent side="bottom">{label}</TooltipContent>
+  </Tooltip>
+);
 
 export const TemplatesPane = ({
   canCreateMemo,
   isCreating,
   onClose,
-  onCreateMemo,
   onCreateSavedTemplate,
   savedTemplates,
   onUseSavedTemplate,
   onDeleteSavedTemplate,
   onUpdateSavedTemplate,
+  onOpenExecutionCenter,
 }: {
   canCreateMemo: boolean;
   isCreating: boolean;
   onClose: () => void;
-  onCreateMemo: (template: MemoTemplate) => void;
   onCreateSavedTemplate: (payload: { name: string; description: string | null; title: string | null; contentMarkdown: string; tags: string[] }) => Promise<void>;
   savedTemplates: SavedMemoTemplate[];
   onUseSavedTemplate: (template: SavedMemoTemplate) => void;
   onDeleteSavedTemplate: (template: SavedMemoTemplate) => void;
   onUpdateSavedTemplate: (templateId: string, payload: { name: string; description: string | null; title: string | null; contentMarkdown: string; tags: string[] }) => Promise<void>;
+  onOpenExecutionCenter: () => void;
 }) => {
-  const { t } = useTranslation();
-  const memoTemplates = useMemo(() => getMemoTemplates(t), [t]);
+  const { t, i18n } = useTranslation();
   const [editingTemplate, setEditingTemplate] = useState<SavedMemoTemplate | null>(null);
   const [creatingTemplate, setCreatingTemplate] = useState(false);
   const [draft, setDraft] = useState({ name: "", description: "", title: "", contentMarkdown: "", tags: "" });
@@ -79,23 +91,31 @@ export const TemplatesPane = ({
     noteTitle?: string | null;
     tags: string[];
     contentMarkdown: string;
-    badge: string;
+    actionLabel: string;
+    actionDisabled: boolean;
     onUse: () => void;
   } | null>(null);
+  const [addingGalleryKey, setAddingGalleryKey] = useState<string | null>(null);
+  // State lags a render behind, so a double click would pass the state check twice.
+  const addingGalleryRef = useRef(false);
 
   const [deleteConfirmTemplate, setDeleteConfirmTemplate] = useState<SavedMemoTemplate | null>(null);
+  const [templateIdCopyNotice, setTemplateIdCopyNotice] = useState<{
+    id: string;
+    status: "copied" | "error";
+  } | null>(null);
+
+  const copyTemplateId = async (template: SavedMemoTemplate) => {
+    const copied = await copyTextToClipboard(template.id);
+    setTemplateIdCopyNotice({ id: template.id, status: copied ? "copied" : "error" });
+    window.setTimeout(() => setTemplateIdCopyNotice(null), copied ? 2200 : 3000);
+  };
 
   const startEditing = (template: SavedMemoTemplate) => {
     setCreatingTemplate(false);
     setEditingTemplate(template);
     setEditorTab("raw");
-    setDraft({
-      name: template.name,
-      description: template.description ?? "",
-      title: template.title ?? "",
-      contentMarkdown: template.contentMarkdown,
-      tags: template.tags.join(", "),
-    });
+    setDraft(createTemplateDraft(template));
   };
 
   const startCreating = () => {
@@ -112,13 +132,7 @@ export const TemplatesPane = ({
 
   const saveEditing = async () => {
     if (!draft.name.trim()) return;
-    const payload = {
-      name: draft.name.trim(),
-      description: draft.description.trim() || null,
-      title: draft.title.trim() || null,
-      contentMarkdown: draft.contentMarkdown,
-      tags: draft.tags.split(",").map((tag) => tag.trim()).filter(Boolean),
-    };
+    const payload = templateDraftToPayload(draft);
     if (creatingTemplate) {
       await onCreateSavedTemplate(payload);
       cancelEditing();
@@ -129,60 +143,101 @@ export const TemplatesPane = ({
     cancelEditing();
   };
 
+  const templateCards = useMemo(
+    () => createTemplateCards(savedTemplates, i18n.resolvedLanguage),
+    [i18n.resolvedLanguage, savedTemplates],
+  );
+
+  const galleryEntries = useMemo(
+    () => listMemoTemplateGallery(i18n.resolvedLanguage),
+    [i18n.resolvedLanguage],
+  );
+
+  // Gallery templates are tagged with their key, so a saved template carrying
+  // that tag marks the gallery entry as added.
+  const addedGalleryTags = useMemo(
+    () => new Set(savedTemplates.flatMap((template) => template.tags)),
+    [savedTemplates],
+  );
+
+  const addGalleryTemplate = async (entry: MemoTemplateGalleryEntry) => {
+    if (addingGalleryRef.current) return;
+    addingGalleryRef.current = true;
+    setAddingGalleryKey(entry.key);
+    try {
+      await onCreateSavedTemplate({
+        name: entry.name,
+        description: entry.description,
+        title: entry.title,
+        contentMarkdown: entry.contentMarkdown,
+        tags: entry.tags,
+      });
+    } catch {
+      // The workspace shows the save failure notice; the entry stays available to retry.
+    } finally {
+      addingGalleryRef.current = false;
+      setAddingGalleryKey(null);
+    }
+  };
+
   const draftHtmlPreview = useMemo(
-    () => (draft.contentMarkdown ? (marked.parse(draft.contentMarkdown) as string) : ""),
+    () => (draft.contentMarkdown ? safeMarkdownPreview(draft.contentMarkdown) : ""),
     [draft.contentMarkdown]
   );
 
   const previewHtmlContent = useMemo(
-    () => (previewTemplate?.contentMarkdown ? (marked.parse(previewTemplate.contentMarkdown) as string) : ""),
+    () => (previewTemplate?.contentMarkdown ? safeMarkdownPreview(previewTemplate.contentMarkdown) : ""),
     [previewTemplate?.contentMarkdown]
   );
 
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-col bg-slate-50/60">
+    <TooltipProvider>
+      <div className="flex h-full min-h-0 min-w-0 flex-col bg-workspace-canvas">
       {/* Header */}
-      <header className="flex h-[calc(3.75rem+env(safe-area-inset-top))] shrink-0 items-end border-b border-slate-200/80 bg-white px-6 pb-3 pt-[env(safe-area-inset-top)] lg:h-16 lg:items-center lg:pb-0 lg:pt-0 shadow-2xs">
+      <header className="flex h-[calc(3.75rem+env(safe-area-inset-top))] shrink-0 items-end justify-between border-b border-slate-200/80 bg-card px-6 pb-3 pt-[env(safe-area-inset-top)] lg:h-16 lg:items-center lg:pb-0 lg:pt-0 shadow-2xs">
         <div className="flex min-w-0 items-center gap-3">
-          <Button size="icon" variant="ghost" title={t("common.back")} aria-label={t("common.back")} onClick={onClose}>
-            <ChevronLeft className="h-5 w-5 text-slate-500" />
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button size="icon" variant="ghost" aria-label={t("common.back")} onClick={onClose}>
+                <ChevronLeft className="h-5 w-5 text-slate-500" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{t("common.back")}</TooltipContent>
+          </Tooltip>
           <div className="min-w-0">
             <h1 className={`flex items-center gap-2 text-slate-900 ${WORKSPACE_PAGE_TITLE_CLASSNAME}`}>
-              <LayoutList className="h-4.5 w-4.5 text-emerald-600" />
+              <LayoutList className="h-4 w-4 text-slate-900" />
               {t("templates.title")}
             </h1>
-            <p className="mt-0.5 text-xs text-slate-500">{t("templates.description")}</p>
           </div>
         </div>
+        <ExecutionCenterButton onClick={onOpenExecutionCenter} />
       </header>
 
       {/* Main Content Area */}
       <main className="min-h-0 flex-1 overflow-y-auto px-4 py-6 lg:px-8 lg:py-8">
         <div className="mx-auto w-full max-w-5xl space-y-8">
 
-          {/* Section 1: My Custom Templates */}
           <section>
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
               <div>
-                <h2 className="flex items-center gap-2 text-sm font-bold text-slate-900">
+                <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-900">
                   <span>{t("templates.myTemplates")}</span>
-                  <span className="rounded-full bg-emerald-100/70 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">
+                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700">
                     {savedTemplates.length}
                   </span>
                 </h2>
-                <p className="mt-0.5 text-xs text-slate-500">{t("templates.myTemplatesSubtitle")}</p>
               </div>
               {!creatingTemplate && !editingTemplate && (
                 <Button
                   type="button"
                   size="sm"
                   variant="outline"
-                  className="gap-1.5 border-slate-200 bg-white text-slate-700 hover:bg-slate-50 hover:text-slate-900 text-xs font-semibold shadow-2xs"
+                  className="gap-1.5 border-slate-200 bg-card text-slate-700 hover:bg-slate-50 hover:text-slate-900 text-xs font-semibold shadow-2xs"
                   onClick={startCreating}
                   disabled={isCreating}
                 >
-                  <Plus className="h-3.5 w-3.5 text-emerald-600" />
+                  <Plus className="h-3.5 w-3.5 text-slate-700" />
                   {t("templates.create")}
                 </Button>
               )}
@@ -190,10 +245,10 @@ export const TemplatesPane = ({
 
             {/* Form for Creating / Editing Template */}
             {(editingTemplate || creatingTemplate) && (
-              <div className="mb-6 rounded-xl border border-emerald-200 bg-white p-5 shadow-xs transition-all">
+              <div className="mb-6 rounded-xl border border-slate-200 bg-card p-5 shadow-xs transition-all">
                 <div className="mb-4 flex items-center justify-between border-b border-slate-100 pb-3">
-                  <h3 className="flex items-center gap-2 text-sm font-bold text-slate-900">
-                    <Pencil className="h-4 w-4 text-emerald-600" />
+                  <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                    <Pencil className="h-4 w-4 text-slate-900" />
                     {creatingTemplate ? t("templates.createTemplateTitle") : t("templates.editTemplateTitle")}
                   </h3>
                   <Button size="icon" variant="ghost" className="h-7 w-7 text-slate-400 hover:text-slate-600" onClick={cancelEditing}>
@@ -205,7 +260,7 @@ export const TemplatesPane = ({
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div>
                       <label className="mb-1 block text-xs font-medium text-slate-700">{t("templates.name")}</label>
-                      <Input
+                      <Input className="focus-visible:border-slate-400 focus-visible:ring-slate-400/25"
                         value={draft.name}
                         onChange={(e) => setDraft((c) => ({ ...c, name: e.target.value }))}
                         placeholder={t("templates.namePlaceholder")}
@@ -213,7 +268,7 @@ export const TemplatesPane = ({
                     </div>
                     <div>
                       <label className="mb-1 block text-xs font-medium text-slate-700">{t("templates.noteTitle")}</label>
-                      <Input
+                      <Input className="focus-visible:border-slate-400 focus-visible:ring-slate-400/25"
                         value={draft.title}
                         onChange={(e) => setDraft((c) => ({ ...c, title: e.target.value }))}
                         placeholder={t("templates.noteTitlePlaceholder")}
@@ -224,7 +279,7 @@ export const TemplatesPane = ({
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div>
                       <label className="mb-1 block text-xs font-medium text-slate-700">{t("templates.descriptionField")}</label>
-                      <Input
+                      <Input className="focus-visible:border-slate-400 focus-visible:ring-slate-400/25"
                         value={draft.description}
                         onChange={(e) => setDraft((c) => ({ ...c, description: e.target.value }))}
                         placeholder={t("templates.descriptionPlaceholder")}
@@ -232,7 +287,7 @@ export const TemplatesPane = ({
                     </div>
                     <div>
                       <label className="mb-1 block text-xs font-medium text-slate-700">{t("templates.tags")}</label>
-                      <Input
+                      <Input className="focus-visible:border-slate-400 focus-visible:ring-slate-400/25"
                         value={draft.tags}
                         onChange={(e) => setDraft((c) => ({ ...c, tags: e.target.value }))}
                         placeholder={t("templates.tagsPlaceholder")}
@@ -247,14 +302,14 @@ export const TemplatesPane = ({
                       <div className="inline-flex rounded-lg bg-slate-100 p-0.5 text-xs font-medium text-slate-600">
                         <button
                           type="button"
-                          className={`rounded-md px-2.5 py-1 transition ${editorTab === "raw" ? "bg-white text-slate-900 shadow-2xs" : "hover:text-slate-900"}`}
+                          className={`rounded-md px-2.5 py-1 transition ${editorTab === "raw" ? "bg-card text-slate-900 shadow-2xs" : "hover:text-slate-900"}`}
                           onClick={() => setEditorTab("raw")}
                         >
                           {t("templates.rawEditor")}
                         </button>
                         <button
                           type="button"
-                          className={`rounded-md px-2.5 py-1 transition ${editorTab === "preview" ? "bg-white text-slate-900 shadow-2xs" : "hover:text-slate-900"}`}
+                          className={`rounded-md px-2.5 py-1 transition ${editorTab === "preview" ? "bg-card text-slate-900 shadow-2xs" : "hover:text-slate-900"}`}
                           onClick={() => setEditorTab("preview")}
                         >
                           {t("templates.previewEditor")}
@@ -264,7 +319,7 @@ export const TemplatesPane = ({
 
                     {editorTab === "raw" ? (
                       <textarea
-                        className="min-h-48 w-full resize-y rounded-lg border border-slate-200 bg-white p-3.5 font-mono text-xs text-slate-900 outline-none focus-visible:border-emerald-500 focus-visible:ring-2 focus-visible:ring-emerald-500/20"
+                        className="min-h-48 w-full resize-y rounded-lg border border-slate-200 bg-card p-3.5 font-mono text-xs text-slate-900 outline-none focus-visible:border-slate-400 focus-visible:ring-2 focus-visible:ring-slate-400/25"
                         value={draft.contentMarkdown}
                         onChange={(e) => setDraft((c) => ({ ...c, contentMarkdown: e.target.value }))}
                         placeholder={t("templates.contentPlaceholder")}
@@ -288,7 +343,8 @@ export const TemplatesPane = ({
                     <Button
                       type="button"
                       size="sm"
-                      className="bg-emerald-600 hover:bg-emerald-700 text-white gap-1.5 font-semibold"
+                      variant="solid"
+                      className="gap-1.5 font-semibold"
                       onClick={() => void saveEditing()}
                       disabled={!draft.name.trim() || isCreating}
                     >
@@ -300,13 +356,13 @@ export const TemplatesPane = ({
               </div>
             )}
 
-            {/* Custom Templates Grid */}
+            {/* Templates Grid */}
             {savedTemplates.length > 0 ? (
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                {savedTemplates.map((template) => (
+                {templateCards.map(({ template: storedTemplate, display: template }) => (
                   <div
                     key={template.id}
-                    className="group relative flex flex-col justify-between rounded-xl border border-slate-200 bg-white p-4 transition-all duration-200 hover:border-emerald-300 hover:shadow-md cursor-pointer"
+                    className="group relative flex cursor-pointer flex-col justify-between rounded-xl border border-slate-200 bg-card p-4 transition-all duration-200 hover:border-slate-300 hover:shadow-md"
                     onClick={() =>
                       setPreviewTemplate({
                         title: template.name,
@@ -314,7 +370,8 @@ export const TemplatesPane = ({
                         noteTitle: template.title,
                         tags: template.tags,
                         contentMarkdown: template.contentMarkdown,
-                        badge: t("templates.badgeCustom"),
+                        actionLabel: t("templates.useThisTemplate"),
+                        actionDisabled: !canCreateMemo || isCreating,
                         onUse: () => onUseSavedTemplate(template),
                       })
                     }
@@ -322,14 +379,11 @@ export const TemplatesPane = ({
                     <div>
                       <div className="mb-2 flex items-start justify-between gap-2">
                         <div className="flex items-center gap-2 min-w-0">
-                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-50 text-emerald-700">
+                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-800">
                             <FilePlus className="h-4 w-4" />
                           </span>
-                          <h3 className="truncate font-bold text-slate-900 text-sm">{template.name}</h3>
+                          <h3 className="truncate text-sm font-semibold text-slate-900">{template.name}</h3>
                         </div>
-                        <span className="shrink-0 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 border border-emerald-200/60">
-                          {t("templates.badgeCustom")}
-                        </span>
                       </div>
 
                       <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-slate-500 min-h-[2.25rem]">
@@ -339,7 +393,7 @@ export const TemplatesPane = ({
                       {template.tags.length > 0 && (
                         <div className="mt-2.5 flex flex-wrap gap-1">
                           {template.tags.map((tag) => (
-                            <span key={tag} className="inline-flex items-center gap-0.5 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600">
+                            <span key={tag} className="inline-flex items-center gap-0.5 rounded-md bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">
                               <Tag className="h-2.5 w-2.5 text-slate-400" />
                               {tag}
                             </span>
@@ -350,34 +404,41 @@ export const TemplatesPane = ({
 
                     <div className="mt-4 border-t border-slate-100 pt-3 flex items-center justify-between gap-2">
                       <div className="flex items-center gap-1 text-slate-400">
-                        <button
-                          type="button"
+                        <TemplateIconAction
                           className="p-1 hover:text-slate-700 transition rounded-md hover:bg-slate-100"
-                          title={t("templates.edit")}
-                          disabled={isCreating}
+                          label={t("templates.copyId")}
                           onClick={(e) => {
                             e.stopPropagation();
-                            startEditing(template);
+                            void copyTemplateId(template);
+                          }}
+                        >
+                          <Copy className="h-3.5 w-3.5" />
+                        </TemplateIconAction>
+                        <TemplateIconAction
+                          className="p-1 hover:text-slate-700 transition rounded-md hover:bg-slate-100"
+                          disabled={isCreating}
+                          label={t("templates.edit")}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            startEditing(storedTemplate);
                           }}
                         >
                           <Pencil className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          type="button"
+                        </TemplateIconAction>
+                        <TemplateIconAction
                           className="p-1 hover:text-rose-600 transition rounded-md hover:bg-rose-50"
-                          title={t("templates.delete")}
                           disabled={isCreating}
+                          label={t("templates.delete")}
                           onClick={(e) => {
                             e.stopPropagation();
                             setDeleteConfirmTemplate(template);
                           }}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          type="button"
+                        </TemplateIconAction>
+                        <TemplateIconAction
                           className="p-1 hover:text-slate-700 transition rounded-md hover:bg-slate-100"
-                          title={t("templates.previewTemplate")}
+                          label={t("templates.previewTemplate")}
                           onClick={(e) => {
                             e.stopPropagation();
                             setPreviewTemplate({
@@ -386,18 +447,19 @@ export const TemplatesPane = ({
                               noteTitle: template.title,
                               tags: template.tags,
                               contentMarkdown: template.contentMarkdown,
-                              badge: t("templates.badgeCustom"),
+                              actionLabel: t("templates.useThisTemplate"),
+                              actionDisabled: !canCreateMemo || isCreating,
                               onUse: () => onUseSavedTemplate(template),
                             });
                           }}
                         >
                           <Eye className="h-3.5 w-3.5" />
-                        </button>
+                        </TemplateIconAction>
                       </div>
 
                       <button
                         type="button"
-                        className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-200/80 bg-emerald-50/70 px-3 py-1.5 text-xs font-semibold text-emerald-800 hover:bg-emerald-600 hover:text-white hover:border-emerald-600 transition-all duration-200 disabled:opacity-50"
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-card px-3 py-1.5 text-xs font-semibold text-slate-800 shadow-2xs transition-colors hover:bg-slate-50 hover:text-slate-950 disabled:opacity-50"
                         disabled={!canCreateMemo || isCreating}
                         onClick={(e) => {
                           e.stopPropagation();
@@ -412,101 +474,104 @@ export const TemplatesPane = ({
                 ))}
               </div>
             ) : !creatingTemplate && !editingTemplate ? (
-              <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-200 bg-white p-7 text-center shadow-2xs">
-                <div className="mb-2.5 flex h-11 w-11 items-center justify-center rounded-full bg-emerald-50 text-emerald-600">
+              <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-200 bg-card p-7 text-center shadow-2xs">
+                <div className="mb-2.5 flex h-11 w-11 items-center justify-center rounded-full bg-slate-100 text-slate-700">
                   <Sparkles className="h-5 w-5" />
                 </div>
-                <h3 className="text-sm font-bold text-slate-900">{t("templates.emptyMyTemplates")}</h3>
+                <h3 className="text-sm font-semibold text-slate-900">{t("templates.emptyMyTemplates")}</h3>
                 <p className="mt-1 max-w-sm text-xs leading-relaxed text-slate-500">{t("templates.emptyMyTemplatesHint")}</p>
                 <Button type="button" size="sm" variant="outline" className="mt-3.5 gap-1.5 border-slate-200 text-xs font-semibold" onClick={startCreating}>
-                  <Plus className="h-3.5 w-3.5 text-emerald-600" />
+                  <Plus className="h-3.5 w-3.5 text-slate-700" />
                   {t("templates.create")}
                 </Button>
               </div>
             ) : null}
           </section>
 
-          {/* Section 2: Built-in Templates */}
           <section>
             <div className="mb-4">
-              <h2 className="text-sm font-bold text-slate-900">{t("templates.builtIn")}</h2>
-              <p className="mt-0.5 text-xs text-slate-500">{t("templates.builtInSubtitle")}</p>
+              <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                <span>{t("templates.gallery")}</span>
+                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700">
+                  {galleryEntries.length}
+                </span>
+              </h2>
+              <p className="mt-1 text-xs text-slate-500">{t("templates.galleryHint")}</p>
             </div>
 
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {memoTemplates.map((template) => {
-                const theme = template.themeColor ?? {
-                  iconBg: "bg-emerald-100/80 text-emerald-700",
-                  iconText: "text-emerald-700",
-                  badgeBg: "bg-emerald-50 text-emerald-800 border-emerald-200/60",
-                  badgeText: "text-emerald-800",
-                  accentBorder: "hover:border-emerald-300",
-                };
-
+              {galleryEntries.map((entry) => {
+                const added = addedGalleryTags.has(entry.key);
+                const addDisabled = isCreating || addingGalleryKey !== null;
                 return (
                   <div
-                    key={template.id}
-                    className={`group relative flex flex-col justify-between rounded-xl border border-slate-200 bg-white p-4 transition-all duration-200 hover:shadow-md cursor-pointer ${theme.accentBorder}`}
+                    key={entry.key}
+                    className="group relative flex cursor-pointer flex-col justify-between rounded-xl border border-slate-200 bg-card p-4 transition-all duration-200 hover:border-slate-300 hover:shadow-md"
                     onClick={() =>
                       setPreviewTemplate({
-                        title: template.title,
-                        description: template.description,
-                        tags: template.tags,
-                        contentMarkdown: template.contentMarkdown,
-                        badge: t("templates.badgeBuiltIn"),
-                        onUse: () => onCreateMemo(template),
+                        title: entry.name,
+                        description: entry.description,
+                        noteTitle: entry.title,
+                        tags: entry.tags,
+                        contentMarkdown: entry.contentMarkdown,
+                        actionLabel: t("templates.addToMyTemplates"),
+                        actionDisabled: addDisabled,
+                        onUse: () => void addGalleryTemplate(entry),
                       })
                     }
                   >
                     <div>
-                      <div className="mb-2.5 flex items-center justify-between gap-2">
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${theme.iconBg}`}>
-                            {renderTemplateIcon(template.iconName)}
-                          </span>
-                          <h3 className="truncate font-bold text-slate-900 text-sm">{template.title}</h3>
-                        </div>
-                        <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600">
-                          {t("templates.badgeBuiltIn")}
+                      <div className="mb-2 flex items-center gap-2 min-w-0">
+                        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-800">
+                          <LibraryBig className="h-4 w-4" />
                         </span>
+                        <h3 className="truncate text-sm font-semibold text-slate-900">{entry.name}</h3>
                       </div>
-
-                      <p className="line-clamp-2 text-xs leading-relaxed text-slate-500 min-h-[2.25rem]">
-                        {template.description}
+                      <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-slate-500 min-h-[2.25rem]">
+                        {entry.description}
                       </p>
                     </div>
 
                     <div className="mt-4 border-t border-slate-100 pt-3 flex items-center justify-between gap-2">
-                      <button
-                        type="button"
-                        className="inline-flex items-center gap-1 text-xs text-slate-500 hover:text-slate-800 transition py-1"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setPreviewTemplate({
-                            title: template.title,
-                            description: template.description,
-                            tags: template.tags,
-                            contentMarkdown: template.contentMarkdown,
-                            badge: t("templates.badgeBuiltIn"),
-                            onUse: () => onCreateMemo(template),
-                          });
-                        }}
-                      >
-                        <Eye className="h-3.5 w-3.5 text-slate-400" />
-                        {t("templates.previewTemplate")}
-                      </button>
+                      <div className="flex items-center gap-1 text-slate-400">
+                        <TemplateIconAction
+                          className="p-1 hover:text-slate-700 transition rounded-md hover:bg-slate-100"
+                          label={t("templates.previewTemplate")}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setPreviewTemplate({
+                              title: entry.name,
+                              description: entry.description,
+                              noteTitle: entry.title,
+                              tags: entry.tags,
+                              contentMarkdown: entry.contentMarkdown,
+                              actionLabel: t("templates.addToMyTemplates"),
+                              actionDisabled: addDisabled,
+                              onUse: () => void addGalleryTemplate(entry),
+                            });
+                          }}
+                        >
+                          <Eye className="h-3.5 w-3.5" />
+                        </TemplateIconAction>
+                        {added && (
+                          <span className="inline-flex items-center gap-1 whitespace-nowrap text-xs font-medium text-slate-500">
+                            <Check className="h-3.5 w-3.5" />
+                            {t("templates.addedToMyTemplates")}
+                          </span>
+                        )}
+                      </div>
 
                       <button
                         type="button"
-                        className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-200/80 bg-emerald-50/70 px-3 py-1.5 text-xs font-semibold text-emerald-800 hover:bg-emerald-600 hover:text-white hover:border-emerald-600 transition-all duration-200 disabled:opacity-50"
-                        disabled={!canCreateMemo || isCreating}
+                        className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-slate-200 bg-card px-3 py-1.5 text-xs font-semibold text-slate-800 shadow-2xs transition-colors hover:bg-slate-50 hover:text-slate-950 disabled:opacity-50"
+                        disabled={addDisabled}
                         onClick={(e) => {
                           e.stopPropagation();
-                          onCreateMemo(template);
+                          void addGalleryTemplate(entry);
                         }}
                       >
-                        {t("templates.useThisTemplate")}
-                        <ArrowRight className="h-3 w-3" />
+                        <Plus className="h-3 w-3" />
+                        {t("templates.addToMyTemplates")}
                       </button>
                     </div>
                   </div>
@@ -526,14 +591,9 @@ export const TemplatesPane = ({
       {/* Preview Dialog */}
       {previewTemplate && (
         <Dialog open={true} onOpenChange={(open) => { if (!open) setPreviewTemplate(null); }}>
-          <DialogContent className="max-w-xl bg-white p-0 overflow-hidden border border-slate-200 rounded-xl shadow-xl">
+          <DialogContent className="max-w-xl bg-card p-0 overflow-hidden border border-slate-200 rounded-xl shadow-xl">
             <DialogHeader className="border-b border-slate-100 px-6 py-4 text-left bg-slate-50/50">
-              <div className="flex items-center gap-2">
-                <span className="rounded-md bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">
-                  {previewTemplate.badge}
-                </span>
-                <DialogTitle className="text-base font-bold text-slate-900">{previewTemplate.title}</DialogTitle>
-              </div>
+              <DialogTitle className="font-bold text-slate-900">{previewTemplate.title}</DialogTitle>
               {previewTemplate.description && (
                 <DialogDescription className="mt-1 text-xs text-slate-500 leading-relaxed">
                   {previewTemplate.description}
@@ -550,8 +610,8 @@ export const TemplatesPane = ({
               )}
 
               <div>
-                <h4 className="mb-2 text-xs font-semibold text-slate-500 uppercase tracking-wider">{t("templates.previewTitle")}</h4>
-                <div className="rounded-xl border border-slate-200 bg-white p-4 text-xs text-slate-800 shadow-2xs min-h-[120px]">
+                <h4 className="mb-2 text-xs font-semibold text-slate-500">{t("templates.previewTitle")}</h4>
+                <div className="rounded-xl border border-slate-200 bg-card p-4 text-xs text-slate-800 shadow-2xs min-h-[120px]">
                   <div className="prose prose-xs max-w-none" dangerouslySetInnerHTML={{ __html: previewHtmlContent }} />
                 </div>
               </div>
@@ -564,15 +624,16 @@ export const TemplatesPane = ({
               <Button
                 type="button"
                 size="sm"
-                className="bg-emerald-600 hover:bg-emerald-700 text-white gap-1.5 font-semibold"
-                disabled={!canCreateMemo || isCreating}
+                variant="solid"
+                className="gap-1.5 font-semibold"
+                disabled={previewTemplate.actionDisabled}
                 onClick={() => {
                   const onUse = previewTemplate.onUse;
                   setPreviewTemplate(null);
                   onUse();
                 }}
               >
-                {t("templates.useThisTemplate")}
+                {previewTemplate.actionLabel}
                 <ArrowRight className="h-3.5 w-3.5" />
               </Button>
             </DialogFooter>
@@ -583,9 +644,9 @@ export const TemplatesPane = ({
       {/* Delete Confirmation Dialog */}
       {deleteConfirmTemplate && (
         <Dialog open={true} onOpenChange={(open) => { if (!open) setDeleteConfirmTemplate(null); }}>
-          <DialogContent className="max-w-md bg-white p-6 border border-slate-200 rounded-xl shadow-xl">
+          <DialogContent className="max-w-md bg-card p-6 border border-slate-200 rounded-xl shadow-xl">
             <DialogHeader className="text-left">
-              <DialogTitle className="text-base font-bold text-slate-900">
+              <DialogTitle className="font-bold text-slate-900">
                 {t("templates.deleteConfirmTitle", { name: deleteConfirmTemplate.name })}
               </DialogTitle>
               <DialogDescription className="mt-2 text-xs text-slate-500 leading-relaxed">
@@ -613,6 +674,16 @@ export const TemplatesPane = ({
           </DialogContent>
         </Dialog>
       )}
-    </div>
+
+      {templateIdCopyNotice && (
+        <ClipboardCopyNotice status={templateIdCopyNotice.status}>
+          {t(
+            templateIdCopyNotice.status === "copied" ? "templates.idCopied" : "templates.idCopyFailed",
+            { id: templateIdCopyNotice.id },
+          )}
+        </ClipboardCopyNotice>
+      )}
+      </div>
+    </TooltipProvider>
   );
 };

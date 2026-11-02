@@ -1,5 +1,6 @@
 import {
   DeleteMemosSchema,
+  DuplicateMemoSchema,
   MemoCreateSchema,
   MergeMemosSchema,
   MemoUpdateSchema,
@@ -13,13 +14,23 @@ import { zValidator } from "@hono/zod-validator";
 import type { Hono } from "hono";
 import type { AppContext, AppEnv, AuditActor, Bindings } from "./api-context";
 import { AppError } from "./app-error";
-import { apiError, notFound } from "./http-errors";
+import { createId } from "./entity-utils";
+import { apiError, badRequest, notFound } from "./http-errors";
 import type { ListMemosInput, ListMemosResult } from "./memo-list-service";
 import { getActorLabel, getAuditActor, getWorkspaceId, requireScopes } from "./request-auth";
+import { deleteReleasedResourceObjects } from "./resource-service";
 import type { DatabaseAdapter } from "./storage-contract";
-
 type MemoRouteDependencies = {
   clampNumber: (value: number, min: number, max: number) => number;
+  createImageResource: (context: AppContext, input: {
+    memoId: string;
+    resourceId?: string;
+    filename: string;
+    mimeType: string;
+    bytes: Uint8Array;
+    actor: AuditActor;
+    source: "upload" | "mcp";
+  }) => Promise<{ id: string }>;
   createMemo: (
     database: DatabaseAdapter,
     workspaceId: string,
@@ -63,6 +74,13 @@ type MemoRouteDependencies = {
     limit: number,
   ) => Promise<MemoRevision[]>;
   listMemos: (database: DatabaseAdapter, input: ListMemosInput) => Promise<ListMemosResult>;
+  duplicateMemo: (
+    context: AppContext,
+    memoId: string,
+    input: { notebookId?: string; title?: string },
+    actor: AuditActor,
+    actorLabel: string,
+  ) => Promise<MemoDetail>;
   mergeMemos: (
     database: DatabaseAdapter,
     workspaceId: string,
@@ -101,7 +119,7 @@ type MemoRouteDependencies = {
     actorLabel: string,
     requireEditSession: boolean,
   ) => Promise<
-    | { memo: MemoDetail; error?: never; message?: never; status?: never; details?: never }
+    | { memo: MemoDetail; releasedResources?: { objectKey: string; storageConfigId: string }[]; error?: never; message?: never; status?: never; details?: never }
     | { error: string; message: string; status?: number; details?: Record<string, unknown> }
   >;
 };
@@ -123,9 +141,11 @@ export const registerMemoRoutes = (
 
     return context.json(await dependencies.listMemos(context.env.storage.db, {
       workspaceId: getWorkspaceId(context),
+      includeTotal: context.req.query("includeTotal") !== "0",
       notebookId: context.req.query("notebookId"),
       includeNotebookDescendants: context.req.query("includeDescendants") === "1",
       query: context.req.query("q"),
+      tag: context.req.query("tag"),
       includeTrash: context.req.query("trash") === "1",
       sort: context.req.query("sort"),
       filter: context.req.query("filter"),
@@ -139,15 +159,76 @@ export const registerMemoRoutes = (
     if (denied) return denied;
 
     try {
+      const input = context.req.valid("json");
       const memo = await dependencies.createMemo(
         context.env.storage.db,
         getWorkspaceId(context),
-        context.req.valid("json"),
+        input,
         getAuditActor(context),
         getActorLabel(context),
       );
       return context.json({ memo }, 201);
     } catch (error) {
+      return handleAppError(context, error);
+    }
+  });
+
+  app.post("/api/v1/memos/with-image", async (context) => {
+    const denied = requireScopes(context, "write:memos");
+    if (denied) return denied;
+
+    const form = await context.req.raw.formData();
+    const file = form.get("file");
+    const notebookId = typeof form.get("notebookId") === "string" ? String(form.get("notebookId")).trim() : "";
+    const title = typeof form.get("title") === "string" ? String(form.get("title")) : "";
+    // multipart/form-data encodes line breaks in text fields as CRLF (browsers
+    // always, and newer Bun versions too), while notes store LF line breaks.
+    const contentMarkdown = typeof form.get("contentMarkdown") === "string"
+      ? String(form.get("contentMarkdown")).replace(/\r\n?/g, "\n")
+      : "";
+    let tags: string[] = [];
+    const tagsValue = form.get("tags");
+    if (typeof tagsValue === "string" && tagsValue.trim()) {
+      try {
+        const parsed = JSON.parse(tagsValue) as unknown;
+        if (!Array.isArray(parsed) || parsed.some((tag) => typeof tag !== "string")) {
+          return badRequest(context, "tags must be a JSON array of strings.");
+        }
+        tags = parsed;
+      } catch {
+        return badRequest(context, "tags must be a JSON array of strings.");
+      }
+    }
+    if (!(file instanceof File) || !notebookId || !contentMarkdown.includes("EDGEVERRESOURCEID")) {
+      return badRequest(context, "notebookId, contentMarkdown, and an image file are required.");
+    }
+    const resourceId = createId("res");
+    const markdown = contentMarkdown.replaceAll("EDGEVERRESOURCEID", resourceId);
+    const actor = getAuditActor(context);
+    let memoId = "";
+    try {
+      const memo = await dependencies.createMemo(
+        context.env.storage.db,
+        getWorkspaceId(context),
+        { notebookId, title, contentMarkdown: markdown, tags },
+        actor,
+        getActorLabel(context),
+      );
+      memoId = memo.id;
+      await dependencies.createImageResource(context, {
+        memoId,
+        resourceId,
+        filename: file.name,
+        mimeType: file.type || "application/octet-stream",
+        bytes: new Uint8Array(await file.arrayBuffer()),
+        actor,
+        source: "upload",
+      });
+      return context.json({ memo, resourceId }, 201);
+    } catch (error) {
+      if (memoId) {
+        await dependencies.deleteMemo(context.env, getWorkspaceId(context), memoId, true, actor).catch(() => undefined);
+      }
       return handleAppError(context, error);
     }
   });
@@ -284,6 +365,9 @@ export const registerMemoRoutes = (
         (result.status ?? (result.error === "not_found" ? 404 : 409)) as 400,
       );
     }
+    if (result.releasedResources?.length) {
+      await deleteReleasedResourceObjects(context.env, result.releasedResources);
+    }
     return context.json({ memo: result.memo });
   };
 
@@ -329,6 +413,24 @@ export const registerMemoRoutes = (
         getAuditActor(context),
       );
       return context.json({ memo });
+    } catch (error) {
+      return handleAppError(context, error);
+    }
+  });
+
+  app.post("/api/v1/memos/:id/duplicate", zValidator("json", DuplicateMemoSchema), async (context) => {
+    const denied = requireScopes(context, "write:memos");
+    if (denied) return denied;
+
+    try {
+      const memo = await dependencies.duplicateMemo(
+        context,
+        context.req.param("id"),
+        context.req.valid("json"),
+        getAuditActor(context),
+        getActorLabel(context),
+      );
+      return context.json({ memo }, 201);
     } catch (error) {
       return handleAppError(context, error);
     }

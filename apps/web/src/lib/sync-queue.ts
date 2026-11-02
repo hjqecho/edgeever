@@ -31,6 +31,9 @@ import { getMemoSaveConflictInfo, parseMemoSaveConflictDetails } from "@/lib/mem
 import { getCachedLocalResourceBytes, removeCachedLocalResourceBytes } from "@/lib/local-resource-cache";
 import { isBrowserOffline } from "@/lib/network-status";
 import { parseTagsText } from "@/lib/utils";
+import { createClientUuid } from "@/lib/client-id";
+import { notebookDeleteIdsFromPayload } from "@/lib/notebook-delete";
+import { acknowledgeNotebookId, hasTemporaryNotebookDependency, notebookRemapTables, repairQueuedNotebookReferences } from "@/lib/notebook-id-remap";
 
 export type { SyncQueueSummary, SyncRunResult } from "@edgeever/shared";
 export type SyncQueueResult = MemoDetail | Notebook | MemoTemplate | Resource | null;
@@ -48,13 +51,24 @@ export const getLocalActionQueueId = (scope: string, kind: LocalActionKind, enti
 export const queueLocalAction = async (scope: string, kind: LocalActionKind, entityId: string, payload: LocalActionPayload, memoId = entityId) => {
   const id = getLocalActionQueueId(scope, kind, entityId);
   const now = new Date().toISOString();
+  const previous = kind === "memo.emptyTrash" ? await localDb.syncQueue.get(id) : null;
+  const previousMemoIds = (previous?.payload as LocalActionPayload | undefined)?.memoIds;
+  const queuedPayload = kind === "memo.emptyTrash" && previous?.kind === kind
+    ? {
+        ...payload,
+        memoIds: [...new Set([
+          ...(Array.isArray(previousMemoIds) ? previousMemoIds : []),
+          ...(Array.isArray(payload.memoIds) ? payload.memoIds : []),
+        ])],
+      }
+    : payload;
   await localDb.syncQueue.put({
     id,
     kind,
     scope,
     memoId,
     status: "pending",
-    payload,
+    payload: queuedPayload,
     attemptCount: 0,
     lastError: null,
     lastErrorCode: null,
@@ -66,43 +80,44 @@ export const queueLocalAction = async (scope: string, kind: LocalActionKind, ent
   });
 };
 
-export const queueMemoUpdate = async (payload: MemoUpdateSyncPayload, scope?: string) => {
+export const putMemoUpdateQueueItem = async (payload: MemoUpdateSyncPayload, scope?: string) => {
   const id = getMemoUpdateQueueId(payload.memoId);
   const now = new Date().toISOString();
-  await localDb.transaction("rw", localDb.syncQueue, async () => {
-    const existing = await localDb.syncQueue.get(id);
-    const existingPayload = existing?.kind === "memo.update"
-      ? existing.payload as MemoUpdateSyncPayload
-      : null;
-    // A previous in-flight save may already have advanced this queue row to a
-    // newer acknowledged server base. A local autosave that started just
-    // before that acknowledgement must not move the successor back again.
-    const nextPayload = existingPayload && existingPayload.expectedRevision > payload.expectedRevision
-      ? {
-          ...payload,
-          expectedRevision: existingPayload.expectedRevision,
-          expectedContentHash: existingPayload.expectedContentHash,
-        }
-      : payload;
+  const existing = await localDb.syncQueue.get(id);
+  const existingPayload = existing?.kind === "memo.update"
+    ? existing.payload as MemoUpdateSyncPayload
+    : null;
+  // A previous in-flight save may already have advanced this queue row to a
+  // newer acknowledged server base. A local autosave that started just
+  // before that acknowledgement must not move the successor back again.
+  const nextPayload = existingPayload && existingPayload.expectedRevision > payload.expectedRevision
+    ? {
+        ...payload,
+        expectedRevision: existingPayload.expectedRevision,
+        expectedContentHash: existingPayload.expectedContentHash,
+      }
+    : payload;
 
-    await localDb.syncQueue.put({
-      id,
-      kind: "memo.update",
-      scope: scope ?? existing?.scope,
-      memoId: payload.memoId,
-      status: "pending",
-      payload: nextPayload,
-      attemptCount: existing?.attemptCount ?? 0,
-      lastError: null,
-      lastErrorCode: null,
-      lastErrorDetails: null,
-      nextAttemptAt: null,
-      claimId: null,
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now,
-    });
+  await localDb.syncQueue.put({
+    id,
+    kind: "memo.update",
+    scope: scope ?? existing?.scope,
+    memoId: payload.memoId,
+    status: "pending",
+    payload: nextPayload,
+    attemptCount: existing?.attemptCount ?? 0,
+    lastError: null,
+    lastErrorCode: null,
+    lastErrorDetails: null,
+    nextAttemptAt: null,
+    claimId: null,
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
   });
 };
+
+export const queueMemoUpdate = async (payload: MemoUpdateSyncPayload, scope?: string) =>
+  localDb.transaction("rw", localDb.syncQueue, () => putMemoUpdateQueueItem(payload, scope));
 
 export const queueMemoCreate = async (scope: string, payload: MemoCreateSyncPayload) => {
   const id = getMemoCreateQueueId(payload.temporaryId);
@@ -194,7 +209,50 @@ const remapQueuedMemoId = async (scope: string, temporaryId: string, remoteMemo:
     if (temporaryDraft) {
       const remoteDraft = await localDb.drafts.get(remoteId);
       const newestDraft = selectNewestLocalDraft(temporaryDraft, remoteDraft);
-      if (newestDraft) await localDb.drafts.put({ ...newestDraft, memoId: remoteId });
+      if (newestDraft) {
+        const remappedDraft = { ...newestDraft, memoId: remoteId };
+        await localDb.drafts.put(remappedDraft);
+
+        const queuedUpdate = await localDb.syncQueue.get(getMemoUpdateQueueId(remoteId));
+        const draftIsCovered = queuedUpdate
+          ? isDraftCoveredByMemoUpdate(queuedUpdate, remappedDraft)
+          : false;
+        const draftMatchesCreatedMemo =
+          remappedDraft.title.trim() === (remoteMemo.title ?? "") &&
+          JSON.stringify(parseTagsText(remappedDraft.tagsText)) === JSON.stringify(remoteMemo.tags) &&
+          JSON.stringify(remappedDraft.contentJson) === JSON.stringify(remoteMemo.contentJson);
+
+        // Editor autosave can persist a draft while memo.create is already in
+        // flight, before the temporary memo has a server revision that can be
+        // queued as memo.update. Preserve that edit as the successor request.
+        if (!draftIsCovered && !draftMatchesCreatedMemo) {
+          const now = new Date().toISOString();
+          await localDb.syncQueue.put({
+            id: getMemoUpdateQueueId(remoteId),
+            kind: "memo.update",
+            scope,
+            memoId: remoteId,
+            status: "pending",
+            payload: {
+              memoId: remoteId,
+              expectedRevision: remoteMemo.revision,
+              expectedContentHash: remoteMemo.contentHash,
+              editSessionId: `create-remap:${remoteId}`,
+              title: remappedDraft.title,
+              contentJson: remappedDraft.contentJson,
+              tags: parseTagsText(remappedDraft.tagsText),
+            },
+            attemptCount: queuedUpdate?.attemptCount ?? 0,
+            lastError: null,
+            lastErrorCode: null,
+            lastErrorDetails: null,
+            nextAttemptAt: null,
+            claimId: null,
+            createdAt: queuedUpdate?.createdAt ?? now,
+            updatedAt: now,
+          });
+        }
+      }
       await localDb.drafts.delete(temporaryId);
     }
   });
@@ -221,12 +279,19 @@ export const discardWebConflicts = async (scope: string) => {
     }
   }
   let discarded = 0;
-  const { putLocalMemo } = await import("@/lib/local-mirror");
+  const { deleteLocalMemo, putLocalMemo } = await import("@/lib/local-mirror");
   for (const item of conflicts) {
     try {
       if (item.kind === "memo.update") {
-        const remote = await api.getMemo(item.memoId, { includeDeleted: true });
-        await putLocalMemo(scope, remote.memo);
+        try {
+          const remote = await api.getMemo(item.memoId, { includeDeleted: true });
+          await putLocalMemo(scope, remote.memo);
+        } catch (error) {
+          if (!(error instanceof ApiRequestError) || error.status !== 404) throw error;
+          // The user explicitly chose to discard this local draft, and the
+          // cloud note was permanently removed on another sync pass.
+          await deleteLocalMemo(scope, item.memoId, true);
+        }
         await localDb.drafts.delete(item.memoId);
       }
       await localDb.syncQueue.delete(item.id);
@@ -275,6 +340,15 @@ export const isMemoUpdateAlreadyApplied = (memo: MemoDetail, item: SyncQueueItem
     return false;
   }
   const payload = item.payload as MemoUpdateSyncPayload;
+  // A local mirror can project a draft over the memo returned by memo.create
+  // while retaining that response's server base. Matching visible content is
+  // not an acknowledgement until the revision or hash has advanced.
+  if (
+    memo.revision === payload.expectedRevision &&
+    memo.contentHash === payload.expectedContentHash
+  ) {
+    return false;
+  }
   if (memo.id !== item.memoId || memo.title !== payload.title) {
     return false;
   }
@@ -317,6 +391,7 @@ const runQueuedChanges = async (options: {
   }
 
   const now = new Date();
+  await repairQueuedNotebookReferences(options.scope);
   const candidates = (await localDb.syncQueue.where("status").anyOf("pending", "error").toArray())
     .filter((item) => !item.nextAttemptAt || new Date(item.nextAttemptAt) <= now)
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
@@ -340,6 +415,9 @@ const runQueuedChanges = async (options: {
   }
 
   for (const candidate of items) {
+    // Creates earlier in this batch may have resolved this dependency. Also
+    // repair actions written by another tab since the initial queue snapshot.
+    await repairQueuedNotebookReferences(candidate.scope, candidate.id);
     const item = await claimQueueItem(candidate.id);
     if (!item) {
       continue;
@@ -368,6 +446,15 @@ const runQueuedChanges = async (options: {
         result.synced += 1;
       }
     } catch (error) {
+      if (
+        item.kind === "notebook.delete"
+        && error instanceof ApiRequestError
+        && (error.code === "notebook_not_empty" || error.code === "bad_request")
+      ) {
+        await localDb.syncQueue.delete(item.id);
+        result.failed += 1;
+        continue;
+      }
       const conflictInfo = getMemoSaveConflictInfo(error);
       const status = conflictInfo ? "conflict" : "error";
       const attemptCount = item.attemptCount + 1;
@@ -405,8 +492,10 @@ const claimQueueItem = (id: string) =>
     if (!item || (item.status !== "pending" && item.status !== "error")) {
       return null;
     }
+    if (hasTemporaryNotebookDependency(item)) return null;
+    if (["memo.update", "memo.delete", "memo.restore"].includes(item.kind) && item.memoId.startsWith("local_")) return null;
 
-    const claimId = crypto.randomUUID();
+    const claimId = createClientUuid();
     const claimedItem: SyncQueueItem = {
       ...item,
       status: "syncing",
@@ -425,15 +514,39 @@ const isDraftCoveredByMemoUpdate = (item: SyncQueueItem, draft: LocalDraft | und
     JSON.stringify(draft.contentJson) === JSON.stringify(payload.contentJson);
 };
 
+const deletedMemoIdsFromAction = (item: SyncQueueItem): string[] => {
+  if (item.kind === "memo.delete") return [item.memoId];
+  if (item.kind !== "memo.deleteBatch" && item.kind !== "memo.emptyTrash") return [];
+  const memoIds = (item.payload as LocalActionPayload).memoIds;
+  return Array.isArray(memoIds) ? memoIds.filter((id): id is string => typeof id === "string") : [];
+};
+
 const acknowledgeClaimedQueueItem = (item: SyncQueueItem, result: SyncQueueResult): Promise<MemoUpdateAcknowledgement> =>
-  localDb.transaction("rw", [localDb.syncQueue, localDb.drafts, localDb.memos], async () => {
+  localDb.transaction("rw", item.kind === "notebook.create"
+    ? [...notebookRemapTables, localDb.drafts]
+    : [localDb.syncQueue, localDb.drafts, localDb.memos], async () => {
     const current = await localDb.syncQueue.get(item.id);
     const memo = result && item.kind === "memo.update" && "contentHash" in result
       ? result as MemoDetail
       : null;
 
     if (current?.claimId === item.claimId && current.status === "syncing") {
+      if (item.kind === "notebook.create" && result && "name" in result && item.scope) {
+        await acknowledgeNotebookId(item.scope, item.memoId, result as Notebook);
+      }
       await localDb.syncQueue.delete(item.id);
+      // A successful delete supersedes older conflicted edits to those notes.
+      // Keep the draft until the server has confirmed the delete, so a failed
+      // delete still leaves the local conflict recoverable.
+      for (const memoId of deletedMemoIdsFromAction(item)) {
+        for (const queued of await localDb.syncQueue.where("memoId").equals(memoId).toArray()) {
+          if (queued.kind !== "memo.update" || queued.status !== "conflict") continue;
+          if (queued.scope && queued.scope !== item.scope) continue;
+          if (queued.createdAt > item.createdAt) continue;
+          await localDb.syncQueue.delete(queued.id);
+          await localDb.drafts.delete(memoId);
+        }
+      }
       if (item.kind !== "memo.create") {
         const draft = await localDb.drafts.get(item.memoId);
         if (!draft || item.kind !== "memo.update" || isDraftCoveredByMemoUpdate(item, draft)) {
@@ -591,6 +704,7 @@ const syncQueueItem = async (item: SyncQueueItem): Promise<SyncQueueResult> => {
     const data = await api.createMemo({
       notebookId: payload.notebookId,
       title: payload.title,
+      contentJson: payload.contentJson,
       contentMarkdown: payload.contentMarkdown,
       tags: payload.tags,
       createdAt: payload.createdAt,
@@ -656,6 +770,13 @@ const syncQueueItem = async (item: SyncQueueItem): Promise<SyncQueueResult> => {
       name: typeof payload.name === "string" ? payload.name : undefined,
       parentId: Object.prototype.hasOwnProperty.call(payload, "parentId") ? (typeof payload.parentId === "string" ? payload.parentId : null) : undefined,
       sortOrder: typeof payload.sortOrder === "number" ? payload.sortOrder : undefined,
+      icon: payload.icon === null || typeof payload.icon === "string" ? payload.icon : undefined,
+      color: payload.color === null || typeof payload.color === "string" ? payload.color : undefined,
+      textColor: payload.textColor === null || typeof payload.textColor === "string" ? payload.textColor : undefined,
+      iconInverted: typeof payload.iconInverted === "boolean" ? payload.iconInverted : undefined,
+      rowInverted: typeof payload.rowInverted === "boolean" ? payload.rowInverted : undefined,
+      isBold: typeof payload.isBold === "boolean" ? payload.isBold : undefined,
+      colorTarget: payload.colorTarget === "icon" || payload.colorTarget === "name" || payload.colorTarget === "both" ? payload.colorTarget : undefined,
     });
     return result.notebook;
   }
@@ -666,7 +787,9 @@ const syncQueueItem = async (item: SyncQueueItem): Promise<SyncQueueResult> => {
   }
   if (item.kind === "notebook.delete") {
     const payload = item.payload as LocalActionPayload;
-    await api.deleteNotebook(String(payload.notebookId ?? item.memoId));
+    for (const notebookId of notebookDeleteIdsFromPayload(payload, String(payload.notebookId ?? item.memoId))) {
+      await api.deleteNotebook(notebookId);
+    }
     return null;
   }
   if (item.kind === "template.create") {

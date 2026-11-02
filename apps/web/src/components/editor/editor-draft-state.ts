@@ -1,5 +1,6 @@
 import {
   docToMarkdown,
+  normalizeImageGalleries,
   resolveMemoContentDoc,
   type MemoDetail,
   type TiptapDoc,
@@ -14,6 +15,23 @@ import { parseTagsText } from "@/lib/utils";
 
 export type EditorDraftSource = "draft" | "queue" | "memo";
 
+export type EditorMemoFields = {
+  memoId: string | null;
+  title: string;
+  tagsText: string;
+};
+
+export const getWritableEditorMemoFields = (
+  fields: EditorMemoFields,
+  memoId: string | null,
+  hydratedMemoId: string | null,
+  hydrating: boolean,
+): EditorMemoFields | null => (
+  !hydrating && memoId && fields.memoId === memoId && hydratedMemoId === memoId
+    ? fields
+    : null
+);
+
 export type EditorDraftState = {
   source: EditorDraftSource;
   sourceKey: string;
@@ -23,6 +41,17 @@ export type EditorDraftState = {
   contentMarkdown: string;
   hasUnsavedChanges: boolean;
 };
+
+/**
+ * TipTap is created with the memo snapshot before the asynchronous local-draft
+ * lookup finishes. Replacing that already-identical document during hydration
+ * resets the ProseMirror view and selection, which is visible in slower desktop
+ * runtimes as a second editor paint.
+ */
+export const shouldReplaceEditorDocument = (
+  currentDocument: TiptapDoc | null,
+  nextDocument: TiptapDoc,
+) => currentDocument === null || JSON.stringify(currentDocument) !== JSON.stringify(nextDocument);
 
 type ResolveEditorDraftStateInput = {
   memo: MemoDetail;
@@ -37,7 +66,7 @@ export const isLocalDraftEquivalentToMemo = (memo: MemoDetail, draft: LocalDraft
   const memoContent = resolveMemoContentDoc(memo.contentJson, memo.contentMarkdown);
   return draft.title === getEditableMemoTitle(memo.title) &&
     stringArraysEqual(parseTagsText(draft.tagsText), memo.tags) &&
-    docToMarkdown(draft.contentJson) === docToMarkdown(memoContent);
+    docToMarkdown(normalizeImageGalleries(draft.contentJson)) === docToMarkdown(memoContent);
 };
 
 /**
@@ -73,12 +102,23 @@ export const resolveEditorDraftState = ({
     : useQueuedPayload && queuedPayload
       ? queuedPayload.tags.join(", ")
       : memo.tags.join(", ");
-  const contentJson = useDraft && draft
+  const sourceContentJson = useDraft && draft
     ? draft.contentJson
     : useQueuedPayload && queuedPayload
       ? queuedPayload.contentJson
       : resolveMemoContentDoc(memo.contentJson, memo.contentMarkdown);
-  const contentMarkdown = docToMarkdown(contentJson);
+  const contentJson = normalizeImageGalleries(sourceContentJson);
+  const repairedSavedContent = source === "memo" && Boolean(
+    memo.contentJson && normalizeImageGalleries(memo.contentJson) !== memo.contentJson,
+  );
+  const storedMarkdown = source === "draft"
+    ? null
+    : source === "queue"
+      ? (typeof queuedPayload?.contentMarkdown === "string" ? queuedPayload.contentMarkdown : null)
+      : (typeof memo.contentMarkdown === "string" ? memo.contentMarkdown : null);
+  // Prefer the stored source so Markdown-mode extra blank lines survive
+  // hydration. JSON→Markdown collapses `\n\n\n` into a single paragraph break.
+  const contentMarkdown = storedMarkdown || docToMarkdown(contentJson);
   const sourceVersion = source === "draft" && draft
     ? draft.updatedAt
     : source === "queue" && queuedUpdate
@@ -92,6 +132,6 @@ export const resolveEditorDraftState = ({
     tagsText,
     contentJson,
     contentMarkdown,
-    hasUnsavedChanges: Boolean(useDraft && !queuedUpdate),
+    hasUnsavedChanges: Boolean((useDraft && !queuedUpdate) || repairedSavedContent),
   };
 };

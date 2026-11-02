@@ -7,7 +7,7 @@ import {
   type MobileAttachmentTarget,
   type MobileResourceTarget,
 } from "../lib/mobile-attachments";
-import { useMobileLocale } from "../lib/mobile-locale";
+import { useMobileLocale, getMobileCatalog } from "../lib/mobile-locale";
 import { useMobileTheme } from "../lib/mobile-theme";
 
 type MobileResourceActionsProps = {
@@ -65,6 +65,66 @@ const copy = {
     save: "Save",
     syncedOnly: "Rename and delete are available after the resource has synced.",
   },
+  ja: {
+    attachmentActions: "添付の操作",
+    imageActions: "画像の操作",
+    cancel: "キャンセル",
+    delete: "削除",
+    attachmentDeleteConfirm: "添付は保存領域とこのノートから完全に削除され、元に戻せません。",
+    attachmentDeleteTitle: "添付を削除",
+    share: "共有",
+    download: "ダウンロード",
+    downloadFailed: "ダウンロードできません",
+    failed: "リソース操作に失敗しました。再試行してください。",
+    filename: "ファイル名",
+    rename: "名前を変更",
+    attachmentRenameTitle: "添付の名前を変更",
+    imageDeleteConfirm: "画像は保存領域とこのノートから完全に削除され、元に戻せません。",
+    imageDeleteTitle: "画像を削除",
+    imageRenameTitle: "画像の名前を変更",
+    save: "保存",
+    syncedOnly: "リソースの同期が終わってから、名前の変更と削除ができます。",
+  },
+  pl: {
+    attachmentActions: "Działania na załączniku",
+    imageActions: "Działania na obrazie",
+    cancel: "Anuluj",
+    delete: "Usuń",
+    attachmentDeleteConfirm: "Załącznik zostanie trwale usunięty z magazynu i z tej notatki. Tej operacji nie można cofnąć.",
+    attachmentDeleteTitle: "Usuń załącznik",
+    share: "Udostępnij",
+    download: "Pobierz",
+    downloadFailed: "Nie można pobrać",
+    failed: "Działanie na zasobie nie powiodło się. Spróbuj ponownie.",
+    filename: "Nazwa pliku",
+    rename: "Zmień nazwę",
+    attachmentRenameTitle: "Zmień nazwę załącznika",
+    imageDeleteConfirm: "Obraz zostanie trwale usunięty z magazynu i z tej notatki. Tej operacji nie można cofnąć.",
+    imageDeleteTitle: "Usuń obraz",
+    imageRenameTitle: "Zmień nazwę obrazu",
+    save: "Zapisz",
+    syncedOnly: "Zmiana nazwy i usuwanie będą dostępne po zsynchronizowaniu zasobu.",
+  },
+  ru: {
+    attachmentActions: "Действия с вложением",
+    imageActions: "Действия с изображением",
+    cancel: "Отмена",
+    delete: "Удалить",
+    attachmentDeleteConfirm: "Вложение будет безвозвратно удалено из хранилища и этой заметки. Это действие нельзя отменить.",
+    attachmentDeleteTitle: "Удалить вложение",
+    share: "Поделиться",
+    download: "Скачать",
+    downloadFailed: "Не удалось скачать",
+    failed: "Не удалось выполнить действие с ресурсом. Попробуйте снова.",
+    filename: "Имя файла",
+    rename: "Переименовать",
+    attachmentRenameTitle: "Переименовать вложение",
+    imageDeleteConfirm: "Изображение будет безвозвратно удалено из хранилища и этой заметки. Это действие нельзя отменить.",
+    imageDeleteTitle: "Удалить изображение",
+    imageRenameTitle: "Переименовать изображение",
+    save: "Сохранить",
+    syncedOnly: "Переименование и удаление будут доступны после синхронизации ресурса.",
+  },
 } as const;
 
 export const MobileAttachmentCard = ({
@@ -87,7 +147,7 @@ export const MobileAttachmentCard = ({
   return (
     <View style={[styles.card, dark && styles.cardDark]}>
       <Pressable
-        accessibilityHint={resolvedLocale === "en-US" ? "Opens the system share sheet for this attachment" : "打开系统分享面板分享此附件"}
+        accessibilityHint={getMobileCatalog(resolvedLocale).mobile.resources.shareAttachmentHint}
         accessibilityLabel={target.filename}
         accessibilityRole="button"
         disabled={busy}
@@ -110,7 +170,7 @@ export const MobileAttachmentCard = ({
         </View>
       </Pressable>
       <Pressable
-        accessibilityLabel={resolvedLocale === "en-US" ? "Attachment actions" : "附件操作"}
+        accessibilityLabel={getMobileCatalog(resolvedLocale).mobile.resources.attachmentActions}
         accessibilityRole="button"
         disabled={busy}
         onPress={onActions}

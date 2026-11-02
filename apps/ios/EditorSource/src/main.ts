@@ -1,63 +1,68 @@
+import { prepareNoteImageAssets } from "@edgeever/shared/note-image-fonts";
+import { noteImageAssetUrls } from "@edgeever/shared/note-image-assets";
 import "./styles.css";
 import "katex/dist/katex.min.css";
-import { Editor, mergeAttributes, Node } from "@tiptap/core";
-import StarterKit from "@tiptap/starter-kit";
+import { Graph } from "@antv/x6";
+import { Editor } from "@tiptap/core";
 import Image from "@tiptap/extension-image";
-import { TaskItem, TaskList } from "@tiptap/extension-list";
 import Placeholder from "@tiptap/extension-placeholder";
 import CodeBlock from "@tiptap/extension-code-block";
-import { TableKit } from "@tiptap/extension-table";
-import { Markdown } from "@tiptap/markdown";
+import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { NodeSelection } from "@tiptap/pm/state";
 import mermaid from "mermaid";
-import { createEdgeEverMathematics } from "./mathematics";
+import { toCanvas } from "html-to-image";
+import {
+  createEdgeEverDocumentExtensions,
+  applyImageAlignment,
+  createNativeUnsupportedContentExtensions,
+  DETAILS_EDITOR_CSS,
+  diagramDocumentToX6Cells,
+  attachDiagramReader,
+  MIND_MAP_CONNECTOR_NAME,
+  mindMapConnector,
+  docToMarkdown,
+  NativeAttachmentMetadata,
+  prepareNativeEditorContent,
+  parseDiagramDocument,
+  stripDiagramDocumentMarker,
+  resolveAttachmentKind,
+  resolveNativeAttachmentContent,
+  restoreNativeEditorContent,
+  wrapDetailsContentHtml,
+  type TiptapDoc,
+  type DiagramDocument,
+} from "@edgeever/shared";
+import { clearMobileEditorUndoHistory, type MobileEditorLocale } from "@edgeever/shared/mobile-editor";
+import {
+  type NoteImageTheme,
+  type NoteImageFontStyle,
+  type NoteImageFontSize,
+  type NoteImageCardWidth,
+  NOTE_IMAGE_CARD_WIDTH_PIXELS,
+  NOTE_IMAGE_BACKGROUND_COLORS,
+  NOTE_IMAGE_THEMES,
+  resolveTheme,
+  buildImageExportBasename,
+  buildNoteImageCardMarkup,
+  generateCardCss,
+  prepareNoteImageContent,
+  planNativeNoteImageRender,
+} from "@edgeever/shared/note-image-card";
+import { createEdgeEverMathematics } from "@edgeever/shared/mathematics";
+import { createIosImageGallery } from "./document-nodes";
+import { createImageInsertTransaction, groupUploadedImages, NATIVE_IMAGE_GALLERY_CSS } from "@edgeever/shared/native-image-gallery";
+import { installPhoneImageFillStyle, NEW_IMAGE_WIDTH_PERCENT } from "@edgeever/shared/image-display";
 
-/** Keep in sync with packages/shared MergeDivider (iOS bundle cannot import monorepo shared). */
-const MERGE_DIVIDER_MARKDOWN_MARKER = "<!-- edgeever:merge-divider -->";
-const MERGE_DIVIDER_TOKENIZER =
-  /^<!--\s*edgeever:merge-divider\s*-->\s*(?:\n+---[ \t]*(?:\n+|$)|(?:\n+|$))/;
+const galleryStyle = document.createElement("style");
+galleryStyle.textContent = NATIVE_IMAGE_GALLERY_CSS;
+document.head.append(galleryStyle);
+installPhoneImageFillStyle();
 
-const MergeDivider = Node.create({
-  name: "edgeeverMergeDivider",
-  group: "block",
-  atom: true,
-  selectable: true,
-  draggable: true,
-  parseHTML() {
-    return [{ tag: "hr[data-edgeever-merge-divider]" }];
-  },
-  renderHTML({ HTMLAttributes }) {
-    return [
-      "hr",
-      mergeAttributes(HTMLAttributes, {
-        "data-edgeever-merge-divider": "true",
-        class: "edgeever-merge-divider",
-      }),
-    ];
-  },
-  renderMarkdown() {
-    return `${MERGE_DIVIDER_MARKDOWN_MARKER}\n\n---`;
-  },
-  parseMarkdown(_token, helpers) {
-    return helpers.createNode("edgeeverMergeDivider");
-  },
-  markdownTokenizer: {
-    name: "edgeeverMergeDivider",
-    level: "block",
-    start(source: string) {
-      return source.indexOf(MERGE_DIVIDER_MARKDOWN_MARKER);
-    },
-    tokenize(source: string) {
-      const match = MERGE_DIVIDER_TOKENIZER.exec(source);
-      if (!match) return undefined;
-      return {
-        type: "edgeeverMergeDivider",
-        raw: match[0],
-        text: "",
-      };
-    },
-  },
-});
+const detailsStyle = document.createElement("style");
+detailsStyle.textContent = DETAILS_EDITOR_CSS;
+document.head.append(detailsStyle);
+
+Graph.registerConnector(MIND_MAP_CONNECTOR_NAME, mindMapConnector, true);
 
 type BridgeMessage =
   | { type: "ready"; startupMs: number }
@@ -65,8 +70,25 @@ type BridgeMessage =
   | { type: "loadResource"; requestId: string; source: string }
   | { type: "resourcePress"; targetJson: string }
   | { type: "imagePreview"; source: string; alt: string }
+  | { type: "doubleTap" }
   | { type: "pickImage" }
   | { type: "searchResult"; count: number; index: number }
+  | { type: "readerScroll"; collapsed: boolean }
+  | { type: "imageExportFontStatus"; requestId: string; status: "loading" | "fallback" | "ready" }
+  | { type: "imageExportFontsReady"; requestId: string }
+  | { type: "imageExportChunk"; requestId: string; chunk: string }
+  | {
+      type: "imageExportComplete";
+      fontFallback: boolean;
+      requestId: string;
+      filename: string;
+      mimeType: string;
+      width: number;
+      height: number;
+      totalImages: number;
+      failedImages: number;
+    }
+  | { type: "imageExportError"; requestId: string; message: string }
   | { type: "activeFlags"; flags: number }
   | { type: "log"; message: string }
   | { type: "error"; message: string };
@@ -117,6 +139,27 @@ function buildAttachmentTargetJson(href: string, label: string): string | null {
   });
 }
 
+const ATTACHMENT_KIND_CLASS_PREFIX = "edgeever-attachment-kind-";
+
+function normalizeAttachmentFilename(label: string): string {
+  return label.replace(/^\s*(?:附件[：:]|Attachment:)\s*/i, "").trim();
+}
+
+function decorateAttachmentLinks(root: ParentNode): void {
+  root.querySelectorAll<HTMLAnchorElement>(
+    'a.edgeever-attachment-link, a[href*="/api/v1/resources/"]'
+  ).forEach((link) => {
+    Array.from(link.classList).forEach((className) => {
+      if (className.startsWith(ATTACHMENT_KIND_CLASS_PREFIX)) link.classList.remove(className);
+    });
+    const filename = normalizeAttachmentFilename(link.textContent || "");
+    link.classList.add(
+      "edgeever-attachment-link",
+      `${ATTACHMENT_KIND_CLASS_PREFIX}${resolveAttachmentKind(null, filename)}`,
+    );
+  });
+}
+
 type ConfigureOptions = {
   mode?: "viewer" | "editor";
   locale?: string;
@@ -125,8 +168,31 @@ type ConfigureOptions = {
 };
 
 const startedAt = performance.now();
+const IMAGE_EXPORT_WIDTH = 768;
+const IMAGE_EXPORT_PIXEL_RATIO = 1.5;
+const IMAGE_EXPORT_CHUNK_SIZE = 256 * 1024;
+
+type ImageExportRequest = {
+  requestId: string;
+  format: "jpeg" | "png";
+  title: string;
+  fallbackTitle: string;
+  notebook?: string;
+  tags?: string[];
+  updatedAt?: string;
+  background?: "mint" | "slate" | "warm" | NoteImageTheme;
+  theme?: NoteImageTheme;
+  fontStyle?: NoteImageFontStyle;
+  fontSize?: NoteImageFontSize;
+  cardWidth?: NoteImageCardWidth;
+  showTitle?: boolean;
+  showNotebook?: boolean;
+  showTags?: boolean;
+  showUpdatedAt?: boolean;
+  branding?: boolean;
+};
 let mode: "viewer" | "editor" = "viewer";
-let locale = "zh-CN";
+let locale: MobileEditorLocale = "zh-CN";
 let currentPlaceholder = "开始输入…";
 let suppressChange = false;
 const resourceResolvers = new Map<string, (dataUrl: string | null) => void>();
@@ -139,6 +205,22 @@ function post(msg: BridgeMessage) {
   } catch {
     // native host unavailable (browser preview)
   }
+}
+
+function sanitizeImageExportBasename(title: string, fallback: string) {
+  return title.replace(/[\u0000-\u001f<>:"/\\|?*]/g, "-").replace(/\s+/g, " ").replace(/[. ]+$/g, "").trim().slice(0, 100) || fallback;
+}
+
+async function blobToBytes(blob: Blob) {
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
 }
 
 function isProtectedResource(src: string): boolean {
@@ -204,6 +286,7 @@ async function renderMermaidBlocks(root: HTMLElement, theme: "light" | "dark") {
     startOnLoad: false,
     securityLevel: "strict",
     theme: theme === "dark" ? "dark" : "default",
+    flowchart: { nodeSpacing: 25, rankSpacing: 30 },
   });
 
   let i = 0;
@@ -216,11 +299,89 @@ async function renderMermaidBlocks(root: HTMLElement, theme: "light" | "dark") {
       const wrap = document.createElement("div");
       wrap.className = "edgeever-mermaid";
       wrap.innerHTML = svg;
+      const renderedSvg = wrap.querySelector("svg");
+      const viewBox = renderedSvg?.viewBox.baseVal;
+      if (renderedSvg && viewBox && viewBox.width > 0 && viewBox.height > 0) {
+        renderedSvg.style.width = `${Math.ceil(viewBox.width)}px`;
+        renderedSvg.style.height = `${Math.ceil(viewBox.height)}px`;
+        renderedSvg.style.maxWidth = "none";
+      }
       pre.replaceWith(wrap);
     } catch {
       // leave code block as-is
     }
   }
+}
+
+let viewerDiagramReader: ReturnType<typeof attachDiagramReader> | null = null;
+let viewerDiagramFrame: number | null = null;
+let viewerDiagram: DiagramDocument | null = null;
+let viewerDiagramGraph: Graph | null = null;
+let viewerDiagramObserver: ResizeObserver | null = null;
+let viewerDiagramContainer: HTMLElement | null = null;
+
+function clearViewerDiagramGraph() {
+  if (viewerDiagramFrame !== null) cancelAnimationFrame(viewerDiagramFrame);
+  viewerDiagramFrame = null;
+  viewerDiagramReader?.dispose();
+  viewerDiagramReader = null;
+  viewerDiagramObserver?.disconnect();
+  viewerDiagramObserver = null;
+  viewerDiagramGraph?.dispose();
+  viewerDiagramGraph = null;
+  viewerDiagramContainer?.remove();
+  viewerDiagramContainer = null;
+  editorEl.querySelector<HTMLElement>(".ProseMirror")?.removeAttribute("hidden");
+}
+
+function renderViewerDiagram(root: HTMLElement, diagram: DiagramDocument, theme: "light" | "dark") {
+  clearViewerDiagramGraph();
+  const proseMirror = root.querySelector<HTMLElement>(".ProseMirror");
+  if (!proseMirror) return false;
+  const cells = diagramDocumentToX6Cells(diagram, theme);
+  const container = document.createElement("div");
+  container.className = "edgeever-x6-diagram";
+  container.setAttribute("role", "img");
+  container.setAttribute("aria-label", diagram.kind === "mind-map" ? "思维导图" : diagram.kind === "architecture" ? "架构图" : "流程图");
+  // Keep TipTap's managed DOM intact. Replacing a node inside ProseMirror makes
+  // the next setContent call unreliable when SwiftUI reuses this WKWebView.
+  proseMirror.hidden = true;
+  root.append(container);
+  const parent = container.parentElement;
+  const measureWidth = () => {
+    if (!parent) return Math.max(1, container.clientWidth);
+    const style = getComputedStyle(parent);
+    const containerStyle = getComputedStyle(container);
+    const horizontalPadding = Number.parseFloat(style.paddingLeft || "0")
+      + Number.parseFloat(style.paddingRight || "0");
+    const horizontalMargin = Number.parseFloat(containerStyle.marginLeft || "0")
+      + Number.parseFloat(containerStyle.marginRight || "0");
+    return Math.max(1, parent.clientWidth - horizontalPadding - horizontalMargin);
+  };
+  const graph = new Graph({
+    container,
+    // The replacement node is empty at mount time and can briefly report 0.
+    // Anchor sizing to its stable parent so X6 cannot persist a 1px canvas.
+    width: measureWidth(),
+    height: Math.max(1, container.clientHeight),
+    background: { color: cells.canvas },
+    grid: false,
+    interacting: false,
+    panning: { enabled: true },
+    mousewheel: { enabled: true, minScale: 0.1, maxScale: 2.5 },
+  });
+  graph.addNodes(cells.nodes);
+  graph.addEdges(cells.edges);
+  const reader = attachDiagramReader(graph, container, { ...diagram, nodes: diagram.nodes.map((node, index) => ({ ...node, width: cells.nodes[index].width, height: cells.nodes[index].height })) }, locale, theme === "dark");
+  viewerDiagramReader = reader;
+  const fit = () => reader.resize(measureWidth(), Math.max(1, container.clientHeight));
+  viewerDiagramFrame = requestAnimationFrame(fit);
+  const observer = new ResizeObserver(fit);
+  observer.observe(parent ?? container);
+  viewerDiagramGraph = graph;
+  viewerDiagramObserver = observer;
+  viewerDiagramContainer = container;
+  return true;
 }
 
 const IMAGE_WIDTH_PRESETS = [
@@ -247,7 +408,7 @@ function clampImageWidth(n: number): number {
  * with the picture — otherwise WKWebView keeps a full-width slot and paints
  * a pale selection wash in the empty half.
  */
-function applyFigureWidth(el: HTMLElement, width: number | null) {
+function applyFigureWidth(el: HTMLElement, width: number | null, alignment?: unknown) {
   const w = width == null ? null : clampImageWidth(width);
   if (w == null) {
     el.style.removeProperty("width");
@@ -255,6 +416,7 @@ function applyFigureWidth(el: HTMLElement, width: number | null) {
     el.style.removeProperty("--ee-image-width");
     delete el.dataset.width;
     el.classList.remove("has-width");
+    applyImageAlignment(el, alignment);
     return;
   }
   const pct = `${w}%`;
@@ -268,6 +430,7 @@ function applyFigureWidth(el: HTMLElement, width: number | null) {
   el.style.setProperty("margin-right", "auto");
   el.style.setProperty("box-sizing", "border-box");
   el.style.setProperty("display", "block");
+  applyImageAlignment(el, alignment);
 }
 
 /**
@@ -373,7 +536,7 @@ function createEdgeEverImageExtension() {
             /* keep markup update even if selection fails */
           }
           ed.view.dispatch(tr);
-          applyFigureWidth(wrapper, nextWidth);
+          applyFigureWidth(wrapper, nextWidth, currentNode.attrs.alignment);
           setActiveWidth(nextWidth);
         };
 
@@ -500,7 +663,7 @@ function createEdgeEverImageExtension() {
           const alt = String(attrs.alt ?? "");
           image.alt = alt;
           const width = parseImageWidth(attrs.width);
-          applyFigureWidth(wrapper, width);
+          applyFigureWidth(wrapper, width, attrs.alignment);
           setActiveWidth(width);
           const src = String(attrs.src ?? "");
           const rid = getResourceIdFromHref(src);
@@ -568,7 +731,7 @@ function createEdgeEverImageExtension() {
               loadImage(updated.attrs as Record<string, unknown>);
             } else {
               setActiveWidth(parseImageWidth(updated.attrs.width));
-              applyFigureWidth(wrapper, parseImageWidth(updated.attrs.width));
+              applyFigureWidth(wrapper, parseImageWidth(updated.attrs.width), updated.attrs.alignment);
             }
             return true;
           },
@@ -580,7 +743,7 @@ function createEdgeEverImageExtension() {
               parseImageWidth(
                 (ed.state.selection as { node?: { attrs?: { width?: unknown } } }).node?.attrs?.width
               ) ?? parseImageWidth(wrapper.dataset.width) ?? parseImageWidth(currentNode.attrs.width);
-            applyFigureWidth(wrapper, selWidth);
+            applyFigureWidth(wrapper, selWidth, currentNode.attrs.alignment);
             // Width bar only in editor when the image is the active node selection.
             if (ed.isEditable && mode === "editor" && !image.hidden) {
               sizeControls.hidden = false;
@@ -606,31 +769,46 @@ function createEdgeEverImageExtension() {
 
 function buildExtensions(placeholder: string) {
   return [
-    StarterKit.configure({
-      codeBlock: false,
+    ...createEdgeEverDocumentExtensions({
+      mathematics: createEdgeEverMathematics(),
+      starterKit: { codeBlock: false, link: false },
+      image: createEdgeEverImageExtension(),
+      gallery: createIosImageGallery(() => locale),
+      pdf: false,
+      file: false,
+      pluginEmbed: false,
+      table: { table: { resizable: false } },
+      markdown: true,
     }),
-    TaskList,
-    TaskItem.configure({ nested: true }),
-    MergeDivider,
-    ...createEdgeEverMathematics(),
+    NativeAttachmentMetadata,
     CodeBlock.configure({
       languageClassPrefix: "language-",
     }),
-    createEdgeEverImageExtension(),
-    TableKit.configure({
-      table: { resizable: false },
-    }),
+    ...createNativeUnsupportedContentExtensions(),
     Placeholder.configure({
       placeholder,
-    }),
-    Markdown.configure({
-      markedOptions: { gfm: true },
     }),
   ];
 }
 
 const editorEl = document.getElementById("editor")!;
 const toolbarEl = document.getElementById("toolbar")!;
+let readerCollapsed = false;
+
+editorEl.addEventListener("scroll", () => {
+  if (mode !== "viewer") return;
+  const collapsed = editorEl.scrollTop > (readerCollapsed ? 4 : 24);
+  if (collapsed === readerCollapsed) return;
+  readerCollapsed = collapsed;
+  post({ type: "readerScroll", collapsed });
+}, { passive: true });
+
+function resetReaderScroll() {
+  if (mode !== "viewer") return;
+  editorEl.scrollTop = 0;
+  readerCollapsed = false;
+  post({ type: "readerScroll", collapsed: false });
+}
 
 const editor = new Editor({
   element: editorEl,
@@ -639,6 +817,7 @@ const editor = new Editor({
   content: { type: "doc", content: [{ type: "paragraph" }] },
   onUpdate: ({ editor: ed }) => {
     refreshToolbarState();
+    requestAnimationFrame(() => decorateAttachmentLinks(editorEl));
     if (suppressChange || mode !== "editor") return;
     emitChange(ed);
   },
@@ -647,6 +826,9 @@ const editor = new Editor({
     attributes: {
       class: "edgeever-prose",
       spellcheck: "true",
+    },
+    transformPastedHTML(html) {
+      return wrapDetailsContentHtml(html);
     },
     handleClick(_view, _pos, event) {
       return handleResourcePointer(event as MouseEvent, "click");
@@ -657,6 +839,17 @@ const editor = new Editor({
       },
     },
   },
+});
+
+// Evernote-style viewer shortcut: a deliberate double tap on ordinary note
+// content enters edit mode. Resource controls keep their existing gestures.
+editorEl.addEventListener("dblclick", (event) => {
+  if (mode !== "viewer") return;
+  const target = event.target as HTMLElement | null;
+  if (!target || target.closest("a, button, img, input, textarea, select, .edgeever-image-node")) return;
+  event.preventDefault();
+  event.stopPropagation();
+  post({ type: "doubleTap" });
 });
 
 /**
@@ -797,17 +990,10 @@ const protectLiteralDollarPairs = (value: unknown): unknown => {
 };
 
 const serializeEditorMarkdown = (ed: Editor) => {
-  const manager = (ed.storage as { markdown?: { manager?: { serialize?: (doc: unknown) => string } } })
-    .markdown?.manager;
-  if (manager?.serialize) {
-    return manager.serialize(protectLiteralDollarPairs(ed.getJSON())).replaceAll(LITERAL_DOLLAR_PLACEHOLDER, "\\$");
-  }
-  return typeof ed.getMarkdown === "function"
-    ? ed.getMarkdown()
-    : ed.getText({ blockSeparator: "\n\n" });
+  return docToMarkdown(restoreNativeEditorContent(ed.getJSON() as TiptapDoc));
 };
 
-let pendingAiSelection: { from: number; to: number; documentFingerprint: string } | null = null;
+let pendingAiSelection: { from: number; to: number; isInline: boolean; documentFingerprint: string } | null = null;
 
 const serializeSelectionMarkdown = (ed: Editor, from: number, to: number) => {
   const manager = (ed.storage as { markdown?: { manager?: { serialize?: (doc: unknown) => string } } })
@@ -821,9 +1007,104 @@ const serializeSelectionMarkdown = (ed: Editor, from: number, to: number) => {
   return ed.state.doc.textBetween(from, to, "\n\n");
 };
 
+type AiSelectionContext = {
+  from: number;
+  to: number;
+  isInline: boolean;
+  markdown: string;
+  text: string;
+};
+
+type ParsedMarkdownNode = {
+  type?: string;
+  text?: string;
+  content?: ParsedMarkdownNode[];
+  [key: string]: unknown;
+};
+
+const AI_INLINE_SENTINEL = "edgeever-inline-sentinel";
+
+const serializeInlineSelectionMarkdown = (ed: Editor, content: unknown[], fallback: string) => {
+  const manager = (ed.storage as { markdown?: { manager?: { serialize?: (doc: unknown) => string } } })
+    .markdown?.manager;
+  if (!manager?.serialize) return fallback;
+  return manager
+    .serialize(protectLiteralDollarPairs({ type: "doc", content: [{ type: "paragraph", content }] }))
+    .replaceAll(LITERAL_DOLLAR_PLACEHOLDER, "\\$");
+};
+
+const getAiSelectionContext = (ed: Editor): AiSelectionContext | null => {
+  const selection = ed.state.selection;
+  if (selection.empty || selection.from >= selection.to) return null;
+
+  const selectedTextblocks: Array<{
+    node: ProseMirrorNode;
+    contentFrom: number;
+    contentTo: number;
+    from: number;
+    to: number;
+  }> = [];
+  ed.state.doc.nodesBetween(selection.from, selection.to, (node, pos) => {
+    if (!node.isTextblock) return true;
+    const contentFrom = pos + 1;
+    const contentTo = contentFrom + node.content.size;
+    const from = Math.max(selection.from, contentFrom);
+    const to = Math.min(selection.to, contentTo);
+    if (to > from) selectedTextblocks.push({ node, contentFrom, contentTo, from, to });
+    return false;
+  });
+
+  if (selectedTextblocks.length === 1) {
+    const block = selectedTextblocks[0];
+    const selectedBlock = block.node.cut(
+      block.from - block.contentFrom,
+      block.to - block.contentFrom,
+    ).toJSON() as { content?: unknown[] };
+    const text = ed.state.doc.textBetween(block.from, block.to, "\n");
+    const markdown = serializeInlineSelectionMarkdown(ed, selectedBlock.content ?? [], text).trim();
+    return markdown
+      ? { from: block.from, to: block.to, isInline: true, markdown, text }
+      : null;
+  }
+
+  const markdown = serializeSelectionMarkdown(ed, selection.from, selection.to).trim();
+  return markdown
+    ? {
+        from: selection.from,
+        to: selection.to,
+        isInline: false,
+        markdown,
+        text: ed.state.doc.textBetween(selection.from, selection.to, "\n\n"),
+      }
+    : null;
+};
+
+const parseAiSelectionReplacement = (ed: Editor, draft: string, isInline: boolean): unknown[] => {
+  const manager = (ed.storage as { markdown?: { manager?: { parse?: (value: string) => { content?: unknown[] } } } })
+    .markdown?.manager;
+  const normalizedDraft = draft.trim();
+  const blockContent = manager?.parse?.(normalizedDraft).content ?? [{ type: "text", text: normalizedDraft }];
+  if (!isInline) return blockContent;
+
+  const inlineDraft = normalizedDraft.replace(/\s*\n+\s*/g, " ");
+  const inlineContent = manager?.parse?.(`${AI_INLINE_SENTINEL}${inlineDraft}`).content;
+  const paragraph = inlineContent?.length === 1 ? inlineContent[0] as ParsedMarkdownNode : null;
+  const paragraphContent = paragraph?.type === "paragraph" ? paragraph.content ?? [] : [];
+  const firstNode = paragraphContent[0];
+  if (firstNode?.type !== "text" || typeof firstNode.text !== "string" || !firstNode.text.startsWith(AI_INLINE_SENTINEL)) {
+    return [{ type: "text", text: inlineDraft }];
+  }
+
+  const firstText = firstNode.text.slice(AI_INLINE_SENTINEL.length);
+  return [
+    ...(firstText ? [{ ...firstNode, text: firstText }] : []),
+    ...paragraphContent.slice(1),
+  ];
+};
+
 function emitChange(ed: Editor) {
   try {
-    const contentJson = JSON.stringify(ed.getJSON());
+    const contentJson = JSON.stringify(restoreNativeEditorContent(ed.getJSON() as TiptapDoc));
     const contentMarkdown = serializeEditorMarkdown(ed);
     post({ type: "change", contentMarkdown, contentJson });
   } catch (error) {
@@ -871,6 +1152,8 @@ function setToolbarVisible(visible: boolean) {
   toolbarEl.innerHTML = "";
   if (!visible) return;
   const actions: Array<{ id: string; label: string; run: () => void }> = [
+    { id: "undo", label: "↩", run: () => editor.chain().focus().undo().run() },
+    { id: "redo", label: "↪", run: () => editor.chain().focus().redo().run() },
     {
       id: "image",
       label: "▧+",
@@ -913,17 +1196,19 @@ function setToolbarVisible(visible: boolean) {
     btn.type = "button";
     btn.textContent = action.label;
     btn.dataset.action = action.id;
-    const labels: Record<string, [string, string]> = {
-      image: ["插入图片", "Insert image"],
-      bold: ["粗体", "Bold"],
-      bullet: ["项目符号列表", "Bullet list"],
-      task: ["任务清单", "Task list"],
-      indent: ["增加列表缩进", "Increase list indent"],
-      outdent: ["减少列表缩进", "Decrease list indent"],
-      quote: ["引用", "Block quote"],
-      hr: ["分隔线", "Horizontal rule"],
+    const labels: Record<string, Record<MobileEditorLocale, string>> = {
+      undo: { "zh-CN": "撤销", "en-US": "Undo", ja: "元に戻す", pl: "Cofnij", ru: "Отменить" },
+      redo: { "zh-CN": "重做", "en-US": "Redo", ja: "やり直す", pl: "Ponów", ru: "Повторить" },
+      image: { "zh-CN": "插入图片", "en-US": "Insert image", ja: "画像を挿入", pl: "Wstaw obraz", ru: "Вставить изображение" },
+      bold: { "zh-CN": "粗体", "en-US": "Bold", ja: "太字", pl: "Pogrubienie", ru: "Полужирный" },
+      bullet: { "zh-CN": "项目符号列表", "en-US": "Bullet list", ja: "箇条書き", pl: "Lista punktowana", ru: "Маркированный список" },
+      task: { "zh-CN": "任务清单", "en-US": "Task list", ja: "タスクリスト", pl: "Lista zadań", ru: "Список задач" },
+      indent: { "zh-CN": "增加列表缩进", "en-US": "Increase list indent", ja: "リストのインデントを増やす", pl: "Zwiększ wcięcie listy", ru: "Увеличить отступ списка" },
+      outdent: { "zh-CN": "减少列表缩进", "en-US": "Decrease list indent", ja: "リストのインデントを減らす", pl: "Zmniejsz wcięcie listy", ru: "Уменьшить отступ списка" },
+      quote: { "zh-CN": "引用", "en-US": "Block quote", ja: "引用", pl: "Cytat", ru: "Цитата" },
+      hr: { "zh-CN": "分隔线", "en-US": "Horizontal rule", ja: "区切り線", pl: "Linia pozioma", ru: "Горизонтальная линия" },
     };
-    btn.setAttribute("aria-label", labels[action.id]?.[locale === "en-US" ? 1 : 0] ?? action.id);
+    btn.setAttribute("aria-label", labels[action.id]?.[locale] ?? action.id);
     btn.addEventListener("click", () => {
       action.run();
       if (action.id !== "image") emitChange(editor);
@@ -941,8 +1226,21 @@ function refreshToolbarState() {
     task: editor.isActive("taskList"),
     quote: editor.isActive("blockquote"),
   };
+  const historyEnabled = (command: "undo" | "redo") => {
+    try {
+      return editor.can().chain().focus()[command]().run();
+    } catch {
+      return false;
+    }
+  };
+  const enabled: Record<string, boolean> = {
+    undo: historyEnabled("undo"),
+    redo: historyEnabled("redo"),
+  };
   toolbarEl.querySelectorAll<HTMLButtonElement>("button[data-action]").forEach((button) => {
-    button.classList.toggle("is-active", active[button.dataset.action ?? ""] ?? false);
+    const actionId = button.dataset.action ?? "";
+    button.classList.toggle("is-active", active[actionId] ?? false);
+    if (actionId in enabled) button.disabled = !enabled[actionId];
   });
 }
 
@@ -950,9 +1248,172 @@ async function afterContentSet(theme: "light" | "dark" = "light") {
   editorEl.querySelectorAll<HTMLElement>("[data-placeholder]").forEach((element) => {
     element.dataset.placeholder = currentPlaceholder;
   });
+  decorateAttachmentLinks(editorEl);
   await hydrateProtectedImages(editorEl);
   if (mode === "viewer") {
-    await renderMermaidBlocks(editorEl, theme);
+    if (!viewerDiagram || !renderViewerDiagram(editorEl, viewerDiagram, theme)) {
+      clearViewerDiagramGraph();
+      await renderMermaidBlocks(editorEl, theme);
+    }
+  }
+}
+
+async function exportNoteImage(request: ImageExportRequest) {
+  if (!request.requestId || (request.format !== "png" && request.format !== "jpeg")) return;
+  const resolvedTheme = resolveTheme(request.background, request.theme);
+  const fontStyle = request.fontStyle ?? "auto";
+  const fontSize = request.fontSize ?? "lg";
+  const cardWidth = request.cardWidth ?? "wide";
+  const targetWidth = NOTE_IMAGE_CARD_WIDTH_PIXELS[cardWidth] || NOTE_IMAGE_CARD_WIDTH_PIXELS.wide;
+  const themeCfg = NOTE_IMAGE_THEMES[resolvedTheme] || NOTE_IMAGE_THEMES.aurora;
+
+  const editorClone = editor.view.dom.cloneNode(true) as HTMLElement;
+  editorClone.removeAttribute("contenteditable");
+  editorClone.querySelectorAll("button, [contenteditable='true']").forEach((element) => {
+    element.removeAttribute("contenteditable");
+    if (element instanceof HTMLButtonElement) element.remove();
+  });
+
+  prepareNoteImageContent(editorClone);
+  const bodyHtml = editorClone.innerHTML;
+
+  const host = document.createElement("div");
+  host.style.cssText = `position:fixed;left:-100000px;top:0;width:${targetWidth}px;pointer-events:none;`;
+  const style = document.createElement("style");
+  style.textContent = generateCardCss({ theme: resolvedTheme, fontStyle, fontSize, cardWidth });
+
+  const cardMarkup = buildNoteImageCardMarkup({
+    title: request.title || request.fallbackTitle,
+    notebook: request.notebook,
+    tags: request.tags,
+    updatedAt: request.updatedAt,
+    bodyHtml,
+    theme: resolvedTheme,
+    fontStyle,
+    showTitle: request.showTitle ?? false,
+    showNotebook: request.showNotebook ?? false,
+    showTags: request.showTags ?? false,
+    showUpdatedAt: request.showUpdatedAt ?? true,
+    showBranding: request.branding ?? true,
+  });
+
+  host.appendChild(style);
+  host.insertAdjacentHTML("beforeend", cardMarkup);
+  const documentRoot = host.lastElementChild as HTMLElement;
+  documentRoot.style.width = `${targetWidth}px`;
+  documentRoot.style.maxWidth = "none";
+  documentRoot.style.margin = "0";
+
+  document.body.appendChild(host);
+
+  try {
+    post({ type: "imageExportFontStatus", requestId: request.requestId, status: "loading" });
+    const assets = await prepareNoteImageAssets({ theme: resolvedTheme, fontStyle, text: [request.title, request.notebook, ...(request.tags || []), request.updatedAt, bodyHtml].join(" "), urls: noteImageAssetUrls });
+    post({ type: "imageExportFontStatus", requestId: request.requestId, status: assets.fontFallback ? "fallback" : "ready" });
+    void assets.fontsReady?.then(() => post({ type: "imageExportFontsReady", requestId: request.requestId }), () => {});
+    style.textContent = assets.css + generateCardCss({ theme: resolvedTheme, fontStyle, fontSize, cardWidth });
+    const images = Array.from(documentRoot.querySelectorAll<HTMLImageElement>("img"));
+    await Promise.race([
+      Promise.all([
+        document.fonts?.ready,
+        ...images.map(async (image) => {
+          if (image.complete) return;
+          try { await image.decode(); } catch { /* Export the readable remainder. */ }
+        }),
+      ]),
+      new Promise<void>((resolve) => window.setTimeout(resolve, 8_000)),
+    ]);
+    const exportedImages = Array.from(
+      documentRoot.querySelectorAll<HTMLImageElement>(".edgeever-card-body img"),
+    );
+    const failedImages = exportedImages.filter((image) => !image.complete || image.naturalWidth === 0).length;
+    const totalHeight = Math.max(1, Math.ceil(documentRoot.getBoundingClientRect().height));
+    const renderPlan = planNativeNoteImageRender(targetWidth, totalHeight);
+    let embedFailedImages = 0;
+    let captureRoot = documentRoot;
+    let captureWrapper: HTMLDivElement | null = null;
+    if (renderPlan.sourceScale < 1) {
+      captureWrapper = document.createElement("div");
+      captureWrapper.style.cssText = `position:relative;width:${renderPlan.sourceWidth}px;height:${renderPlan.sourceHeight}px;overflow:hidden;`;
+      documentRoot.replaceWith(captureWrapper);
+      captureWrapper.appendChild(documentRoot);
+      documentRoot.style.transform = `scale(${renderPlan.sourceScale})`;
+      documentRoot.style.transformOrigin = "top left";
+      captureRoot = captureWrapper;
+    }
+    const backgroundColor = NOTE_IMAGE_BACKGROUND_COLORS[resolvedTheme] || themeCfg.canvasBg;
+
+    const missingImagePlaceholder = "data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=";
+    const renderCanvas = (root: HTMLElement, width: number, height: number) => toCanvas(root, {
+      backgroundColor,
+      cacheBust: false,
+      height,
+      imagePlaceholder: missingImagePlaceholder,
+      onImageErrorHandler: (event) => {
+        embedFailedImages += 1;
+        if (event instanceof Event && event.target instanceof HTMLImageElement) {
+          event.target.src = missingImagePlaceholder;
+        }
+      },
+      pixelRatio: renderPlan.pixelRatio,
+      fontEmbedCSS: assets.fontCss,
+      width,
+    });
+    let canvas: HTMLCanvasElement;
+    try {
+      canvas = await renderCanvas(captureRoot, renderPlan.sourceWidth, renderPlan.sourceHeight);
+    } catch {
+      const retryScale = renderPlan.sourceScale * 0.75;
+      if (retryScale < 0.5) throw new Error("NOTE_IMAGE_RENDER_FAILED");
+      const retryWidth = Math.max(1, Math.floor(targetWidth * retryScale));
+      const retryHeight = Math.max(1, Math.floor(totalHeight * retryScale));
+      if (!captureWrapper) {
+        captureWrapper = document.createElement("div");
+        documentRoot.replaceWith(captureWrapper);
+        captureWrapper.appendChild(documentRoot);
+      }
+      captureWrapper.style.cssText = `position:relative;width:${retryWidth}px;height:${retryHeight}px;overflow:hidden;`;
+      documentRoot.style.transform = `scale(${retryScale})`;
+      documentRoot.style.transformOrigin = "top left";
+      try {
+        canvas = await renderCanvas(captureWrapper, retryWidth, retryHeight);
+      } catch {
+        throw new Error("NOTE_IMAGE_RENDER_FAILED");
+      }
+    }
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(
+        (result) => result ? resolve(result) : reject(new Error("Image renderer returned an empty file")),
+        request.format === "jpeg" ? "image/jpeg" : "image/png",
+        request.format === "jpeg" ? 0.92 : 1,
+      );
+    });
+
+    const extension = request.format === "jpeg" ? "jpg" : "png";
+    const basename = buildImageExportBasename(request.title, request.fallbackTitle);
+    const bytes = await blobToBytes(blob);
+    const filename = `${basename}.${extension}`;
+    const mimeType = request.format === "jpeg" ? "image/jpeg" : "image/png";
+    const base64 = bytesToBase64(bytes);
+    for (let offset = 0; offset < base64.length; offset += IMAGE_EXPORT_CHUNK_SIZE) {
+      post({ type: "imageExportChunk", requestId: request.requestId, chunk: base64.slice(offset, offset + IMAGE_EXPORT_CHUNK_SIZE) });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    post({
+      type: "imageExportComplete",
+      fontFallback: assets.fontFallback,
+      requestId: request.requestId,
+      filename,
+      mimeType,
+      width: canvas.width,
+      height: canvas.height,
+      totalImages: exportedImages.length,
+      failedImages: Math.min(exportedImages.length, failedImages + embedFailedImages),
+    });
+  } catch (error) {
+    post({ type: "imageExportError", requestId: request.requestId, message: error instanceof Error ? error.message : "Image export failed" });
+  } finally {
+    host.remove();
   }
 }
 
@@ -960,6 +1421,7 @@ export type EdgeEverEditorAPI = {
   configure: (opts: ConfigureOptions) => void;
   setMarkdown: (md: string) => void;
   setDocumentFromJSON: (json: string) => void;
+  resetReaderScroll: () => void;
   resolveResource: (requestId: string, dataUrl: string | null) => void;
   getMarkdown: () => string;
   getDocument: () => string;
@@ -971,17 +1433,31 @@ export type EdgeEverEditorAPI = {
   exec: (actionId: string) => void;
   beginImageUpload: (uploadId: string, previewDataUrl: string) => void;
   completeImageUpload: (uploadId: string, imageUrl: string, alt: string) => void;
+  groupImages: (sources: string[]) => boolean;
   cancelImageUpload: (uploadId: string) => void;
   search: (query: string, requestedIndex: number) => void;
+  exportImage: (request: ImageExportRequest) => void;
 };
 
 const api: EdgeEverEditorAPI = {
+  resetReaderScroll,
+  exportImage(request) {
+    void exportNoteImage(request);
+  },
   configure(opts) {
     const nextMode = opts.mode === "editor" ? "editor" : "viewer";
     const modeChanged = nextMode !== mode;
     mode = nextMode;
-    locale = opts.locale === "en-US" ? "en-US" : "zh-CN";
-    editor.setEditable(mode === "editor");
+    locale = opts.locale === "en-US" || opts.locale === "ja" || opts.locale === "pl" ? opts.locale : "zh-CN";
+    // Configuring a reused WebView is not a document edit. TipTap otherwise emits
+    // an update for its old (often empty) body before native pushes the share seed.
+    editor.setEditable(mode === "editor", false);
+    if (modeChanged) {
+      // Without that update event, node views that hide editing controls (the image
+      // gallery toolbar) keep their old state. A no-op transaction refreshes them
+      // without recording history or triggering a save.
+      editor.view.dispatch(editor.state.tr.setMeta("addToHistory", false).setMeta("preventUpdate", true));
+    }
     setToolbarVisible(mode === "editor");
     document.documentElement.dataset.theme = opts.theme || "light";
     document.body.classList.toggle("viewer-mode", mode === "viewer");
@@ -1008,40 +1484,56 @@ const api: EdgeEverEditorAPI = {
 
   setMarkdown(md) {
     suppressChange = true;
+    const diagram = mode === "viewer" ? parseDiagramDocument(md) : null;
+    viewerDiagram = diagram;
+    // Valid IR is drawn by read-only X6. Do not inject a hidden Mermaid
+    // document into TipTap; invalid envelopes keep the stripped fence.
+    const displayMarkdown = mode === "viewer"
+      ? (diagram ? "" : stripDiagramDocumentMarker(md))
+      : md;
     try {
-      editor.commands.setContent(md || "", { contentType: "markdown" } as never);
+      editor.commands.setContent(displayMarkdown || "", { contentType: "markdown" } as never);
     } catch {
       try {
         const manager = (editor.storage as { markdown?: { manager?: { parse: (s: string) => unknown } } }).markdown
           ?.manager;
         if (manager) {
-          editor.commands.setContent(manager.parse(md || "") as never);
+          editor.commands.setContent(manager.parse(displayMarkdown || "") as never);
         } else {
           throw new Error("no markdown manager");
         }
       } catch {
         editor.commands.setContent({
           type: "doc",
-          content: [{ type: "paragraph", content: md ? [{ type: "text", text: md }] : [] }],
+          content: [{ type: "paragraph", content: displayMarkdown ? [{ type: "text", text: displayMarkdown }] : [] }],
         });
       }
     }
     // Keep editability. Do NOT focus("end") here — native re-pushes content on SwiftUI
     // updates while typing; focusing would yank the caret to the document bottom mid-edit.
     editor.setEditable(mode === "editor");
+    clearMobileEditorUndoHistory(editor);
+    refreshToolbarState();
     suppressChange = false;
     void afterContentSet((document.documentElement.dataset.theme as "light" | "dark") || "light");
   },
 
   setDocumentFromJSON(json) {
     suppressChange = true;
+    viewerDiagram = null;
+    clearViewerDiagramGraph();
     try {
-      const doc = JSON.parse(json);
-      editor.commands.setContent(doc);
+      const doc = JSON.parse(json) as TiptapDoc;
+      editor.commands.setContent(prepareNativeEditorContent(
+        resolveNativeAttachmentContent(doc),
+        locale,
+      ));
     } catch {
       editor.commands.setContent({ type: "doc", content: [{ type: "paragraph" }] });
     }
     editor.setEditable(mode === "editor");
+    clearMobileEditorUndoHistory(editor);
+    refreshToolbarState();
     suppressChange = false;
     void afterContentSet((document.documentElement.dataset.theme as "light" | "dark") || "light");
   },
@@ -1059,21 +1551,26 @@ const api: EdgeEverEditorAPI = {
   },
 
   getDocument() {
-    return JSON.stringify(editor.getJSON());
+    return JSON.stringify(restoreNativeEditorContent(editor.getJSON() as TiptapDoc));
   },
 
   captureSelection() {
-    const { from, to, empty } = editor.state.selection;
-    if (empty || from >= to) {
+    const context = getAiSelectionContext(editor);
+    if (!context) {
       pendingAiSelection = null;
       return null;
     }
-    pendingAiSelection = { from, to, documentFingerprint: JSON.stringify(editor.getJSON()) };
+    pendingAiSelection = {
+      from: context.from,
+      to: context.to,
+      isInline: context.isInline,
+      documentFingerprint: JSON.stringify(editor.getJSON()),
+    };
     return JSON.stringify({
-      from,
-      to,
-      markdown: serializeSelectionMarkdown(editor, from, to),
-      text: editor.state.doc.textBetween(from, to, "\n\n"),
+      from: context.from,
+      to: context.to,
+      markdown: context.markdown,
+      text: context.text,
     });
   },
 
@@ -1091,7 +1588,9 @@ const api: EdgeEverEditorAPI = {
       const manager = (editor.storage as { markdown?: { manager?: { parse?: (value: string) => { content?: unknown[] } } } })
         .markdown?.manager;
       const parsed = manager?.parse?.(markdown);
-      const content = parsed?.content ?? markdown;
+      const content = applyMode === "replace"
+        ? parseAiSelectionReplacement(editor, markdown, range.isInline)
+        : parsed?.content ?? markdown;
       const insertRange = applyMode === "append" ? { from: to, to } : { from, to };
       editor.chain().focus().insertContentAt(insertRange, content as never).run();
       pendingAiSelection = null;
@@ -1149,7 +1648,7 @@ const api: EdgeEverEditorAPI = {
     editor
       .chain()
       .focus()
-      .setImage({ src: previewDataUrl, alt: uploadId })
+      .setImage({ src: previewDataUrl, alt: uploadId, width: NEW_IMAGE_WIDTH_PERCENT })
       .run();
     // mark last image
     const imgs = editorEl.querySelectorAll("img");
@@ -1159,20 +1658,18 @@ const api: EdgeEverEditorAPI = {
   },
 
   completeImageUpload(uploadId, imageUrl, alt) {
-    // Always mutate ProseMirror via setImage — DOM-only attr writes do not persist.
-    // Native hydrate rewrites display src under file:// after emitChange.
-    editor
-      .chain()
-      .focus()
-      .setImage({ src: imageUrl, alt: alt || uploadId || "" })
-      .run();
-    const imgs = editorEl.querySelectorAll("img");
-    const last = imgs[imgs.length - 1] as HTMLImageElement | undefined;
-    if (last) {
-      last.dataset.originalSrc = imageUrl;
-      delete last.dataset.uploadId;
-    }
+    if (!editor.isEditable) return;
+    editor.view.dispatch(createImageInsertTransaction(editor.state, {
+      src: imageUrl, alt: alt || uploadId || "",
+      width: NEW_IMAGE_WIDTH_PERCENT,
+    }));
     emitChange(editor);
+  },
+
+  groupImages(sources) {
+    const grouped = groupUploadedImages(editor, sources);
+    if (grouped) emitChange(editor);
+    return grouped;
   },
 
   cancelImageUpload(uploadId) {

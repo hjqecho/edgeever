@@ -15,15 +15,15 @@
 }
 
 :root.dark .edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) {
-  --editor-theme-bg: #121212;
-  --editor-theme-text: #cbd5e1;
-  --editor-theme-muted: #94a3b8;
-  --editor-theme-heading: #fafafa;
-  --editor-theme-accent: #34d399;
-  --editor-theme-soft: #1a241e;
-  --editor-theme-border: #2d3d33;
-  --editor-theme-code-bg: #1e293b;
-  --editor-theme-code-text: #3eb575;
+  --editor-theme-bg: var(--workspace-editor);
+  --editor-theme-text: #dedede;
+  --editor-theme-muted: #a3a3a3;
+  --editor-theme-heading: #f5f5f5;
+  --editor-theme-accent: #3ecf78;
+  --editor-theme-soft: #252525;
+  --editor-theme-border: #3b3b3b;
+  --editor-theme-code-bg: #151515;
+  --editor-theme-code-text: #70dfa0;
 }
 
 .edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror {
@@ -37,7 +37,9 @@
 .edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror h1,
 .edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror h2,
 .edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror h3,
-.edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror h4 {
+.edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror h4,
+.edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror h5,
+.edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror h6 {
   color: var(--editor-theme-heading);
   font-family: var(--editor-theme-font);
   margin: 1.8rem 0 0.8rem;
@@ -69,6 +71,24 @@
   padding-left: 0;
 }
 
+.edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror h4 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin: 1.4rem 0 0.6rem;
+}
+
+.edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror h5 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 1.25rem 0 0.5rem;
+}
+
+.edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror h6 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 1.1rem 0 0.45rem;
+}
+
 .edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror strong {
   color: var(--editor-theme-accent);
   background: rgba(7, 193, 96, 0.08);
@@ -79,18 +99,14 @@
 
 :root.dark .edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror strong {
   color: var(--editor-theme-accent);
-  background: rgba(52, 211, 153, 0.15);
+  background: rgb(62 207 120 / 13%);
 }
 
 .edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror a {
   color: var(--editor-theme-accent);
   text-decoration: underline;
-  text-decoration-color: rgba(7, 193, 96, 0.4);
+  text-decoration-color: color-mix(in srgb, var(--editor-theme-accent) 42%, transparent);
   text-underline-offset: 2px;
-}
-
-:root.dark .edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror a {
-  text-decoration-color: rgba(52, 211, 153, 0.4);
 }
 
 .edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror blockquote {
@@ -136,13 +152,6 @@
   background: var(--editor-theme-soft);
   color: var(--editor-theme-heading);
   font-weight: 600;
-  border: 1px solid var(--editor-theme-border);
-  padding: 12px 16px;
-}
-
-.edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror td {
-  border: 1px solid var(--editor-theme-border);
-  padding: 12px 16px;
 }
 
 .edgeever-editor[data-editor-theme="wechat-green"]:not([data-editor-theme="default"]) .ProseMirror .edgeever-theme-block {

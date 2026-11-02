@@ -8,6 +8,8 @@ import {
   type MemoTemplate,
   type TiptapDoc,
 } from "@edgeever/shared";
+import { listMemoTemplateGallery } from "@edgeever/shared/memo-template-gallery";
+import { localizeDefaultMemoTemplate } from "@edgeever/shared/memo-template-seeds";
 import { zValidator } from "@hono/zod-validator";
 import type { Hono } from "hono";
 import { audit } from "./audit";
@@ -86,7 +88,7 @@ const getMemoTemplateRow = async (
      WHERE id = ? AND workspace_id = ?`
   ).bind(id, workspaceId).first<MemoTemplateRow>();
 
-const getMemoTemplate = async (
+export const getMemoTemplate = async (
   db: DatabaseAdapter,
   workspaceId: string,
   id: string
@@ -95,20 +97,32 @@ const getMemoTemplate = async (
   return row ? mapMemoTemplateRow(row) : null;
 };
 
+export const listMemoTemplates = async (
+  db: DatabaseAdapter,
+  workspaceId: string,
+): Promise<MemoTemplate[]> => {
+  const rows = await db.prepare(
+    `SELECT id, name, description, title, content_json, content_markdown, tags_json, created_at, updated_at
+     FROM memo_templates
+     WHERE workspace_id = ?
+     ORDER BY updated_at DESC, name ASC`,
+  ).bind(workspaceId).all<MemoTemplateRow>();
+  return rows.results.map(mapMemoTemplateRow);
+};
+
 export const registerTemplateRoutes = (
   app: Hono<AppEnv>,
   dependencies: TemplateRouteDependencies
 ) => {
   const { createMemoRecord, getMemoDetail } = dependencies;
   app.get("/api/v1/templates", async (c) => {
-    const rows = await c.env.storage.db.prepare(
-      `SELECT id, name, description, title, content_json, content_markdown, tags_json, created_at, updated_at
-       FROM memo_templates
-       WHERE workspace_id = ?
-       ORDER BY updated_at DESC, name ASC`
-    ).bind(getWorkspaceId(c)).all<MemoTemplateRow>();
+    return c.json({ templates: await listMemoTemplates(c.env.storage.db, getWorkspaceId(c)) });
+  });
 
-    return c.json({ templates: rows.results.map(mapMemoTemplateRow) });
+  // Optional templates clients offer next to the workspace's own; reading the
+  // gallery never writes to the workspace.
+  app.get("/api/v1/templates/gallery", (c) => {
+    return c.json({ templates: listMemoTemplateGallery(c.req.query("locale")) });
   });
 
   app.post("/api/v1/templates", zValidator("json", TemplateCreateSchema), async (c) => {
@@ -189,10 +203,11 @@ export const registerTemplateRoutes = (
     const id = c.req.param("id");
     const input = c.req.valid("json");
     const workspaceId = getWorkspaceId(c);
-    const template = await getMemoTemplate(c.env.storage.db, workspaceId, id);
-    if (!template) {
+    const stored = await getMemoTemplate(c.env.storage.db, workspaceId, id);
+    if (!stored) {
       return notFound(c, "Template not found");
     }
+    const template = input.locale ? localizeDefaultMemoTemplate(stored, input.locale) : stored;
 
     const memo = await createMemoRecord(c.env.storage.db, workspaceId, {
       notebookId: input.notebookId,

@@ -10,6 +10,7 @@ final class WorkspaceStore {
     var searchText = ""
     var sort: MemoSortMode = .updatedDesc
     var filter: MobileMemoFilterMode = .all
+    var selectedTag: String?
     var totalCount = 0
     var nextOffset: Int?
     var isLoadingList = false
@@ -18,12 +19,9 @@ final class WorkspaceStore {
     var selectionMode = false
     var selectedMemoIds: Set<String> = []
     var showNotebookPicker = false
+    var startCreatingNotebook = false
     var showActions = false
-
-    /// Memo id that should play a return-bounce when the list reappears after create/edit.
-    var bounceMemoId: String?
-    /// Bumped so the same memo can bounce again on a later return.
-    var bouncePulse: Int = 0
+    var showTagFilterPicker = false
 
     private var searchTask: Task<Void, Never>?
 
@@ -61,8 +59,12 @@ final class WorkspaceStore {
         defer { isLoadingList = false }
         let offset = resetOffset ? 0 : (nextOffset ?? memos.count)
         let notebookIds: [String]? = {
-            guard let selectedNotebookId else { return nil }
-            return NotebookHierarchy.descendantIds(notebooks: notebooks, targetNotebookId: selectedNotebookId)
+            guard selectedTag == nil, let selectedNotebookId else { return nil }
+            return NotebookHierarchy.scopeIds(
+                notebooks: notebooks,
+                targetNotebookId: selectedNotebookId,
+                includeDescendants: env.preferences.showDescendantNotes
+            )
         }()
         let result = try env.mirror.listMemos(
             scope: scope,
@@ -70,6 +72,7 @@ final class WorkspaceStore {
                 notebookId: nil,
                 notebookIds: notebookIds,
                 q: searchText,
+                tag: selectedTag,
                 sort: sort,
                 filter: filter.toMemoFilterMode(),
                 limit: 50,
@@ -94,7 +97,22 @@ final class WorkspaceStore {
     }
 
     func toggleFilter(_ requested: MobileMemoFilterMode) {
+        selectedTag = nil
         filter = MobileUI.toggleMemoFilterMode(current: filter, requested: requested)
+    }
+
+    func selectTag(_ tag: String?) {
+        selectedTag = tag
+        selectedNotebookId = nil
+        filter = .all
+        searchText = ""
+        clearSelection()
+    }
+
+    func clearTagFilter() {
+        selectedTag = nil
+        filter = .all
+        clearSelection()
     }
 
     func enterSelection(memoId: String? = nil) {
@@ -130,17 +148,6 @@ final class WorkspaceStore {
             selectionMode = true
             selectedMemoIds.formUnion(visibleIds)
         }
-    }
-
-    /// Request a rebound animation on a list card after create/edit returns to the list.
-    func requestMemoBounce(memoId: String?) {
-        guard let memoId, !memoId.isEmpty else { return }
-        bounceMemoId = memoId
-        bouncePulse &+= 1
-    }
-
-    func clearMemoBounce() {
-        bounceMemoId = nil
     }
 
     func softDelete(env: AppEnvironment, memoId: String) async {

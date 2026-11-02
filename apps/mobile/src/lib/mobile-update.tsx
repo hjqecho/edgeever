@@ -3,17 +3,21 @@ import Constants from "expo-constants";
 import { AppState, Linking, Platform, type AppStateStatus } from "react-native";
 import * as Updates from "expo-updates";
 import { Alert } from "../components/LocalizedText";
-import { useMobileLocale } from "./mobile-locale";
+import { googlePlayUpdates, openGooglePlayDetails } from "../../modules/edgeever-app-store";
+import { MobilePlayUpdate } from "./mobile-play-update";
+import { useMobileLocale, getMobileCatalog, formatMobileCopy } from "./mobile-locale";
 import {
   ANDROID_INSTALL_UPDATE_SOURCES,
   findNewerMobileRelease,
-  getDefaultMobileInstallUpdateUrl,
+  type MobileInstallUpdateSource,
+  type MobileRelease,
 } from "./mobile-release";
+import { openMobileInstallUpdateSource } from "./mobile-update-destination";
 
 const FOREGROUND_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 type MobileUpdateStatus = "idle" | "checking" | "available" | "downloading" | "ready";
-export type MobileUpdateKind = "install" | "ota";
+export type MobileUpdateKind = "install" | "ota" | "play";
 
 type MobileUpdateContextValue = {
   checkForUpdate: () => Promise<void>;
@@ -34,16 +38,110 @@ const MobileUpdateContext = createContext<MobileUpdateContextValue>({
   status: "idle",
   updateKind: null,
 });
+const MobileUpdateAvailableContext = createContext(false);
 
 export const MobileUpdateProvider = ({ children }: { children: ReactNode }) => {
   const { resolvedLocale } = useMobileLocale();
+  const [installRelease, setInstallRelease] = useState<MobileRelease | null>(null);
   const [status, setStatus] = useState<MobileUpdateStatus>("idle");
   const [updateKind, setUpdateKind] = useState<MobileUpdateKind | null>(null);
   const activeCheckRef = useRef<Promise<void> | null>(null);
   const lastAutomaticCheckRef = useRef(0);
-  const isSupported = !__DEV__ && Updates.isEnabled;
-  const english = resolvedLocale === "en-US";
+  const playActiveRef = useRef(false);
+  const playUpdate = useMemo(() => new MobilePlayUpdate(googlePlayUpdates, (state) => {
+    if (state.status === "unavailable") {
+      if (playActiveRef.current) {
+        playActiveRef.current = false;
+        setUpdateKind("install");
+        setStatus("available");
+      }
+      return;
+    }
+    playActiveRef.current = true;
+    setUpdateKind("play");
+    setStatus(state.status);
+  }), []);
+  const isSupported = !__DEV__ && (Platform.OS === "android" || Updates.isEnabled);
   const installedVersion = Updates.runtimeVersion ?? Constants.expoConfig?.version ?? null;
+
+  const showLinkError = useCallback(() => {
+    Alert.alert(
+      getMobileCatalog(resolvedLocale).mobile.update.linkOpenFailed,
+      getMobileCatalog(resolvedLocale).mobile.update.linkOpenFailedHint
+    );
+  }, [resolvedLocale]);
+
+  const openManualUpdateSource = useCallback((source: MobileInstallUpdateSource) => {
+    void openMobileInstallUpdateSource(source, {
+      linking: Linking,
+      openGooglePlayDetails,
+    }).then((result) => {
+      if (result.status !== "google-play-unavailable") {
+        return;
+      }
+      if (result.reason === "not-installed") {
+        Alert.alert(
+          getMobileCatalog(resolvedLocale).mobile.update.playNotInstalled,
+          getMobileCatalog(resolvedLocale).mobile.update.playNotInstalledHint
+        );
+        return;
+      }
+      const { fallbackUrl, reason } = result;
+      const copy = reason === "disabled"
+        ? {
+          message: getMobileCatalog(resolvedLocale).mobile.update.playDisabledHint,
+          title: getMobileCatalog(resolvedLocale).mobile.update.playDisabled,
+        }
+        : {
+          message: getMobileCatalog(resolvedLocale).mobile.update.playUnavailableHint,
+          title: getMobileCatalog(resolvedLocale).mobile.update.playUnavailable,
+        };
+      Alert.alert(copy.title, copy.message, [
+        {
+          text: getMobileCatalog(resolvedLocale).common.cancel,
+          style: "cancel",
+        },
+        {
+          text: getMobileCatalog(resolvedLocale).mobile.update.openWebListing,
+          onPress: () => {
+            void Linking.openURL(fallbackUrl).catch(showLinkError);
+          },
+        },
+      ]);
+    }).catch(() => {
+      showLinkError();
+    });
+  }, [resolvedLocale, showLinkError]);
+
+  const openInstallUpdateOptions = useCallback((release: MobileRelease | null) => {
+    const googlePlay = ANDROID_INSTALL_UPDATE_SOURCES.find((source) => source.id === "google-play");
+    const github = ANDROID_INSTALL_UPDATE_SOURCES.find((source) => source.id === "github");
+    if (!googlePlay || !github) {
+      return;
+    }
+    Alert.alert(
+      getMobileCatalog(resolvedLocale).mobile.update.available,
+      !release
+        ? getMobileCatalog(resolvedLocale).mobile.update.chooseSourceHint
+        : formatMobileCopy(getMobileCatalog(resolvedLocale).mobile.update.releaseAvailable, { version: release.version }),
+      [
+        {
+          text: getMobileCatalog(resolvedLocale).mobile.update.later,
+          style: "cancel",
+        },
+        {
+          icon: "github",
+          text: getMobileCatalog(resolvedLocale).mobile.update.sources[github.id],
+          onPress: () => openManualUpdateSource(github),
+        },
+        {
+          icon: "google-play",
+          text: getMobileCatalog(resolvedLocale).mobile.update.sources[googlePlay.id],
+          onPress: () => openManualUpdateSource(googlePlay),
+        },
+      ]
+    );
+  }, [resolvedLocale, openManualUpdateSource]);
 
   const runCheck = useCallback((userInitiated: boolean) => {
     if (activeCheckRef.current) {
@@ -53,10 +151,8 @@ export const MobileUpdateProvider = ({ children }: { children: ReactNode }) => {
     if (!isSupported) {
       if (userInitiated) {
         Alert.alert(
-          english ? "Updates unavailable" : "暂无法检查更新",
-          english
-            ? "Update checks are available in installed release builds, not Expo Go or development builds."
-            : "检查更新仅适用于已安装的正式版，Expo Go 和开发版暂不支持。"
+          getMobileCatalog(resolvedLocale).mobile.update.unsupported,
+          getMobileCatalog(resolvedLocale).mobile.update.unsupportedHint
         );
       }
       return Promise.resolve();
@@ -65,6 +161,9 @@ export const MobileUpdateProvider = ({ children }: { children: ReactNode }) => {
     const check = (async () => {
       try {
         setStatus("checking");
+        if (Platform.OS === "android" && await playUpdate.check(!userInitiated)) {
+          return;
+        }
 
         if (Platform.OS === "android") {
           try {
@@ -73,6 +172,7 @@ export const MobileUpdateProvider = ({ children }: { children: ReactNode }) => {
             }
             const release = await findNewerMobileRelease(installedVersion);
             if (release) {
+              setInstallRelease(release);
               setUpdateKind("install");
               setStatus("available");
               return;
@@ -80,11 +180,20 @@ export const MobileUpdateProvider = ({ children }: { children: ReactNode }) => {
           } catch {
             // Fall back to Expo's in-app update check when the release API is unavailable.
           }
+          // Play can publish before GitHub. A failed native flow must still leave
+          // manual destinations available even when the release API has no update.
+          if (playUpdate.hasKnownUpdate) {
+            setInstallRelease(null);
+            setUpdateKind("install");
+            setStatus("available");
+            return;
+          }
         }
 
-        const result = await Updates.checkForUpdateAsync();
+        const result = Updates.isEnabled ? await Updates.checkForUpdateAsync() : { isAvailable: false };
 
         if (!result.isAvailable) {
+          setInstallRelease(null);
           setUpdateKind(null);
           setStatus("idle");
           return;
@@ -93,6 +202,7 @@ export const MobileUpdateProvider = ({ children }: { children: ReactNode }) => {
         setUpdateKind("ota");
         setStatus("available");
       } catch {
+        setInstallRelease(null);
         setUpdateKind(null);
         setStatus("idle");
       }
@@ -103,7 +213,39 @@ export const MobileUpdateProvider = ({ children }: { children: ReactNode }) => {
       activeCheckRef.current = null;
     });
     return check;
-  }, [english, installedVersion, isSupported]);
+  }, [resolvedLocale, installedVersion, isSupported, playUpdate]);
+
+  const completePlayUpdate = useCallback(async () => {
+    if (await googlePlayUpdates.complete()) return;
+    Alert.alert(
+      getMobileCatalog(resolvedLocale).mobile.update.installFailed,
+      getMobileCatalog(resolvedLocale).mobile.update.installFailedHint,
+      [
+        { text: getMobileCatalog(resolvedLocale).mobile.update.later, style: "cancel" },
+        { text: getMobileCatalog(resolvedLocale).mobile.update.chooseSource, onPress: () => openInstallUpdateOptions(installRelease) },
+      ]
+    );
+  }, [resolvedLocale, installRelease, openInstallUpdateOptions]);
+
+  useEffect(() => {
+    if (Platform.OS !== "android" || !isSupported) return;
+    const subscription = googlePlayUpdates.subscribe(playUpdate.receive);
+    return () => subscription.remove();
+  }, [isSupported, playUpdate]);
+
+  const readyPromptVersionRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (updateKind !== "play" || status !== "ready" || readyPromptVersionRef.current === playUpdate.state.versionCode) return;
+    readyPromptVersionRef.current = playUpdate.state.versionCode;
+    Alert.alert(
+      getMobileCatalog(resolvedLocale).mobile.update.ready,
+      getMobileCatalog(resolvedLocale).mobile.update.playReadyHint,
+      [
+        { text: getMobileCatalog(resolvedLocale).mobile.update.later, style: "cancel" },
+        { text: getMobileCatalog(resolvedLocale).mobile.update.restart, onPress: () => { void completePlayUpdate(); } },
+      ]
+    );
+  }, [completePlayUpdate, resolvedLocale, playUpdate, status, updateKind]);
 
   useEffect(() => {
     const attemptAutomaticCheck = () => {
@@ -116,7 +258,14 @@ export const MobileUpdateProvider = ({ children }: { children: ReactNode }) => {
     const timer = setTimeout(attemptAutomaticCheck, 1_500);
     const subscription = AppState.addEventListener("change", (nextState: AppStateStatus) => {
       if (nextState === "active") {
-        attemptAutomaticCheck();
+        if (Platform.OS === "android" && isSupported) {
+          // Recover downloads even during the normal six-hour check cooldown.
+          void playUpdate.check(false).then((handled) => {
+            if (!handled || playUpdate.state.status === "available") attemptAutomaticCheck();
+          });
+        } else {
+          attemptAutomaticCheck();
+        }
       }
     });
 
@@ -124,34 +273,23 @@ export const MobileUpdateProvider = ({ children }: { children: ReactNode }) => {
       clearTimeout(timer);
       subscription.remove();
     };
-  }, [runCheck]);
+  }, [isSupported, playUpdate, runCheck]);
 
   const openUpdate = useCallback(async () => {
+    if (updateKind === "play") {
+      if (status === "ready") {
+        await completePlayUpdate();
+      } else if (status !== "downloading") {
+        const result = await playUpdate.start();
+        if (result === "unavailable") openInstallUpdateOptions(installRelease);
+      }
+      return;
+    }
     if (updateKind === "install") {
-      if (Platform.OS === "android") {
-        Alert.alert(
-          english ? "Update available" : "发现新版本",
-          english
-            ? "Get the latest version from GitHub Releases."
-            : "可从 GitHub Releases 获取最新版本。",
-          [
-            ...ANDROID_INSTALL_UPDATE_SOURCES.map((source) => ({
-              text: english ? source.labelEn : source.labelZh,
-              onPress: () => {
-                void Linking.openURL(source.url);
-              },
-            })),
-            {
-              text: english ? "Cancel" : "取消",
-              style: "cancel" as const,
-            },
-          ]
-        );
+      if (Platform.OS !== "android") {
         return;
       }
-
-      const url = getDefaultMobileInstallUpdateUrl(Platform.OS);
-      await Linking.openURL(url);
+      openInstallUpdateOptions(installRelease);
       return;
     }
 
@@ -170,25 +308,24 @@ export const MobileUpdateProvider = ({ children }: { children: ReactNode }) => {
       if (!result.isNew) {
         setUpdateKind(null);
         setStatus("idle");
-        if (english) {
-          Alert.alert("No update", "No downloadable in-app update was found.");
-        } else {
-          Alert.alert("暂无更新", "没有可下载的应用内更新。");
-        }
+        Alert.alert(
+          getMobileCatalog(resolvedLocale).mobile.update.none,
+          getMobileCatalog(resolvedLocale).mobile.update.noneHint,
+        );
         return;
       }
 
       setStatus("ready");
       Alert.alert(
-        english ? "Update ready" : "更新已就绪",
-        english ? "Restart now to apply the update." : "重启后即可应用更新。",
+        getMobileCatalog(resolvedLocale).mobile.update.ready,
+        getMobileCatalog(resolvedLocale).mobile.update.readyHint,
         [
           {
-            text: english ? "Later" : "稍后",
+            text: getMobileCatalog(resolvedLocale).mobile.update.later,
             style: "cancel",
           },
           {
-            text: english ? "Restart" : "立即重启",
+            text: getMobileCatalog(resolvedLocale).mobile.update.restart,
             onPress: () => {
               void Updates.reloadAsync();
             },
@@ -198,30 +335,34 @@ export const MobileUpdateProvider = ({ children }: { children: ReactNode }) => {
     } catch {
       setStatus("available");
       Alert.alert(
-        english ? "Update failed" : "更新失败",
-        english
-          ? "Could not download the in-app update. Try again later."
-          : "无法下载应用内更新，请稍后再试。"
+        getMobileCatalog(resolvedLocale).mobile.update.failed,
+        getMobileCatalog(resolvedLocale).mobile.update.failedHint
       );
     }
-  }, [english, isSupported, status, updateKind]);
+  }, [completePlayUpdate, resolvedLocale, installRelease, isSupported, openInstallUpdateOptions, playUpdate, status, updateKind]);
 
+  const hasUpdate = status === "available" || status === "ready" || status === "downloading";
   const value = useMemo<MobileUpdateContextValue>(
     () => ({
       checkForUpdate: () => {
         return runCheck(true);
       },
-      hasUpdate: status === "available" || status === "ready" || status === "downloading",
+      hasUpdate,
       installedVersion,
       isSupported,
       openUpdate,
       status,
       updateKind,
     }),
-    [installedVersion, isSupported, openUpdate, runCheck, status, updateKind]
+    [hasUpdate, installedVersion, isSupported, openUpdate, runCheck, status, updateKind]
   );
 
-  return <MobileUpdateContext.Provider value={value}>{children}</MobileUpdateContext.Provider>;
+  return (
+    <MobileUpdateAvailableContext.Provider value={hasUpdate}>
+      <MobileUpdateContext.Provider value={value}>{children}</MobileUpdateContext.Provider>
+    </MobileUpdateAvailableContext.Provider>
+  );
 };
 
 export const useMobileUpdate = () => useContext(MobileUpdateContext);
+export const useMobileUpdateAvailable = () => useContext(MobileUpdateAvailableContext);

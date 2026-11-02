@@ -1,48 +1,43 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   DEFAULT_MEMO_LIST_WIDTH_PX,
+  DEFAULT_NOTEBOOK_SIDEBAR_WIDTH_PX,
   clampMemoListWidth,
+  clampNotebookSidebarWidth,
   readDesktopFocusModePreference,
   readImageCompressionPreference,
   readMemoListWidthPreference,
+  readNotebookSidebarCollapsedPreference,
+  readNotebookSidebarWidthPreference,
   readShortcutSettingsPreference,
-  readSyncIntervalPreference,
   writeDesktopFocusModePreference,
   writeImageCompressionPreference,
   writeMemoListWidthPreference,
+  writeNotebookSidebarCollapsedPreference,
+  writeNotebookSidebarWidthPreference,
   writeShortcutSettingsPreference,
-  writeSyncIntervalPreference,
   type ShortcutSettings,
 } from "@/lib/app-helpers";
 
-export type SyncIntervalPreference = "off" | "30s" | "5m" | "15m" | "30m" | "1h" | "2h";
-
-export const syncIntervalMsToPreference = (intervalMs: number | null): SyncIntervalPreference => {
-  switch (intervalMs) {
-    case null: return "off";
-    case 300_000: return "5m";
-    case 900_000: return "15m";
-    case 1_800_000: return "30m";
-    case 3_600_000: return "1h";
-    case 7_200_000: return "2h";
-    default: return "30s";
-  }
-};
-
 export const useWorkspacePreferences = () => {
   const [imageCompressionEnabled, setImageCompressionEnabled] = useState(readImageCompressionPreference);
-  const [syncIntervalMs, setSyncIntervalMs] = useState(readSyncIntervalPreference);
   const [desktopFocusMode, setDesktopFocusModeState] = useState(readDesktopFocusModePreference);
+  const [notebookSidebarCollapsed, setNotebookSidebarCollapsedState] = useState(readNotebookSidebarCollapsedPreference);
+  const [notebookSidebarWidth, setNotebookSidebarWidthState] = useState(readNotebookSidebarWidthPreference);
   const [shortcutSettings, setShortcutSettings] = useState<ShortcutSettings>(readShortcutSettingsPreference);
   const [memoListWidth, setMemoListWidthState] = useState(readMemoListWidthPreference);
 
   useEffect(() => writeImageCompressionPreference(imageCompressionEnabled), [imageCompressionEnabled]);
-  useEffect(() => writeSyncIntervalPreference(syncIntervalMsToPreference(syncIntervalMs)), [syncIntervalMs]);
   useEffect(() => writeShortcutSettingsPreference(shortcutSettings), [shortcutSettings]);
 
   const setDesktopFocusMode = useCallback((enabled: boolean) => {
     setDesktopFocusModeState(enabled);
     writeDesktopFocusModePreference(enabled);
+  }, []);
+
+  const setNotebookSidebarCollapsed = useCallback((collapsed: boolean) => {
+    setNotebookSidebarCollapsedState(collapsed);
+    writeNotebookSidebarCollapsedPreference(collapsed);
   }, []);
 
   const setMemoListWidth = useCallback((width: number) => {
@@ -51,21 +46,34 @@ export const useWorkspacePreferences = () => {
     writeMemoListWidthPreference(nextWidth);
   }, []);
 
+  const setNotebookSidebarWidth = useCallback((width: number) => {
+    const nextWidth = clampNotebookSidebarWidth(width);
+    setNotebookSidebarWidthState(nextWidth);
+    writeNotebookSidebarWidthPreference(nextWidth);
+  }, []);
+
   const resetMemoListWidth = useCallback(() => {
     setMemoListWidth(DEFAULT_MEMO_LIST_WIDTH_PX);
   }, [setMemoListWidth]);
+
+  const resetNotebookSidebarWidth = useCallback(() => {
+    setNotebookSidebarWidth(DEFAULT_NOTEBOOK_SIDEBAR_WIDTH_PX);
+  }, [setNotebookSidebarWidth]);
 
   return {
     desktopFocusMode,
     imageCompressionEnabled,
     memoListWidth,
+    notebookSidebarCollapsed,
+    notebookSidebarWidth,
     resetMemoListWidth,
+    resetNotebookSidebarWidth,
     setDesktopFocusMode,
+    setNotebookSidebarCollapsed,
     setImageCompressionEnabled,
     setMemoListWidth,
+    setNotebookSidebarWidth,
     setShortcutSettings,
-    setSyncIntervalMs,
     shortcutSettings,
-    syncIntervalMs,
   };
 };
